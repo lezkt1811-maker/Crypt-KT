@@ -269,10 +269,10 @@ const DASHBOARD_HTML = `<!doctype html>
   body { margin: 0; background: #0b0716; color: #e8e3ff; font-family: system-ui, sans-serif; padding: 16px; }
   h1 { font-size: 18px; margin: 0 0 4px; color: #ff2fd0; }
   .sub { font-size: 12px; color: #8a7bb8; margin-bottom: 12px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .card { background: #120b22; border: 1px solid #2a1a4d; border-radius: 6px; padding: 12px; }
   .label { font-size: 11px; color: #8a7bb8; text-transform: uppercase; letter-spacing: .08em; }
-  .val { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .val { font-size: 18px; font-weight: 700; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pos { color: #39ff8f; }
   .neg { color: #ff3860; }
   canvas { width: 100%; height: 220px; display: block; margin-top: 10px; }
@@ -283,6 +283,13 @@ const DASHBOARD_HTML = `<!doctype html>
   .watch { color: #8a7bb8; }
   .warn { color: #ffb84d; font-size: 12px; margin: 12px 0 0; }
   .section { margin-top: 10px; }
+  body { background: radial-gradient(ellipse at 15% 0%, rgba(255,47,208,0.14), transparent 55%), radial-gradient(ellipse at 90% 100%, rgba(47,227,255,0.12), transparent 55%), #0b0716; min-height: 100vh; }
+  h1 { text-shadow: 0 0 8px rgba(255,47,208,0.9), 0 0 22px rgba(255,47,208,0.5); }
+  .card { box-shadow: 0 0 18px rgba(255,47,208,0.10), inset 0 0 18px rgba(47,227,255,0.04); }
+  .chartcard { box-shadow: 0 0 26px rgba(255,47,208,0.22), 0 0 60px rgba(47,227,255,0.10), inset 0 0 22px rgba(47,227,255,0.05); border-color: #5a2a8a; }
+  .pos { text-shadow: 0 0 10px rgba(57,255,143,0.8); }
+  .neg { text-shadow: 0 0 10px rgba(255,56,96,0.8); }
+  canvas { height: 280px; cursor: crosshair; touch-action: none; }
 </style>
 </head>
 <body>
@@ -298,8 +305,8 @@ const DASHBOARD_HTML = `<!doctype html>
   <div class="card"><div class="label">Holding</div><div class="val" id="holding">-</div></div>
 </div>
 
-<div class="card section">
-  <div class="label">Price, last 2 hours (green dot = buy, red dot = sell)</div>
+<div class="card section chartcard">
+  <div class="label">Price, last 2 hours - touch or hover to inspect</div>
   <canvas id="chart"></canvas>
 </div>
 
@@ -329,7 +336,10 @@ async function load() {
   }
 }
 
+var lastS = null, hoverX = null;
+
 function render(s) {
+  lastS = s;
   setText('portfolio', money(s.portfolio));
   var pl = document.getElementById('pl');
   pl.textContent = (s.profitLoss >= 0 ? '+' : '') + money(s.profitLoss);
@@ -342,50 +352,172 @@ function render(s) {
   renderLog(s.recentDecisions);
 }
 
+function timeLabel(ts) {
+  return new Date(ts * 60000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
 function drawChart(s) {
   var c = document.getElementById('chart');
   var dpr = window.devicePixelRatio || 1;
-  c.width = c.clientWidth * dpr;
-  c.height = c.clientHeight * dpr;
+  var cssW = c.clientWidth, cssH = c.clientHeight;
+  c.width = cssW * dpr;
+  c.height = cssH * dpr;
   var g = c.getContext('2d');
-  g.clearRect(0, 0, c.width, c.height);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+
   var pts = s.prices || [];
   if (pts.length < 2) {
     g.fillStyle = '#8a7bb8';
-    g.font = (14 * dpr) + 'px sans-serif';
-    g.fillText('Waiting for price history...', 10 * dpr, 30 * dpr);
+    g.font = '14px system-ui, sans-serif';
+    g.fillText('Waiting for price history...', 10, 30);
     return;
   }
+
   var vals = pts.map(function (p) { return p.close; });
   var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
-  var range = (max - min) || 1;
-  var pad = 10 * dpr, w = c.width, h = c.height;
-  function x(i) { return pad + i / (pts.length - 1) * (w - 2 * pad); }
-  function y(v) { return h - pad - (v - min) / range * (h - 2 * pad); }
+  var pad0 = ((max - min) * 0.12) || (max * 0.0005);
+  min -= pad0; max += pad0;
+  var L = 56, R = 16, T = 14, B = 24;
+  var w = cssW - L - R, h = cssH - T - B;
+  function x(i) { return L + i / (pts.length - 1) * w; }
+  function y(v) { return T + (1 - (v - min) / (max - min)) * h; }
 
+  // faint grid with price labels
+  g.lineWidth = 1;
+  g.font = '11px system-ui, sans-serif';
+  for (var k = 0; k <= 4; k++) {
+    var gv = min + (max - min) * k / 4, gy = y(gv);
+    g.strokeStyle = 'rgba(138,123,184,0.16)';
+    g.beginPath(); g.moveTo(L, gy); g.lineTo(cssW - R, gy); g.stroke();
+    g.fillStyle = '#8a7bb8';
+    g.textAlign = 'right';
+    g.fillText('$' + Math.round(gv).toLocaleString(), L - 8, gy + 4);
+  }
+  g.textAlign = 'left';
+
+  // glowing area under the line
   g.beginPath();
   pts.forEach(function (p, i) { if (i) g.lineTo(x(i), y(p.close)); else g.moveTo(x(i), y(p.close)); });
-  g.strokeStyle = '#ff2fd0';
-  g.lineWidth = 2 * dpr;
-  g.stroke();
+  g.lineTo(x(pts.length - 1), T + h);
+  g.lineTo(x(0), T + h);
+  g.closePath();
+  var fill = g.createLinearGradient(0, T, 0, T + h);
+  fill.addColorStop(0, 'rgba(255,47,208,0.38)');
+  fill.addColorStop(1, 'rgba(255,47,208,0)');
+  g.fillStyle = fill;
+  g.fill();
 
-  var indexByTs = {};
-  pts.forEach(function (p, i) { indexByTs[p.ts] = i; });
+  function linePath() {
+    g.beginPath();
+    pts.forEach(function (p, i) { if (i) g.lineTo(x(i), y(p.close)); else g.moveTo(x(i), y(p.close)); });
+  }
+  var grad = g.createLinearGradient(L, 0, cssW - R, 0);
+  grad.addColorStop(0, '#2fe3ff');
+  grad.addColorStop(1, '#ff2fd0');
+  g.save();
+  g.lineJoin = 'round';
+  g.lineCap = 'round';
+  linePath();
+  g.strokeStyle = grad;
+  g.lineWidth = 10;
+  g.globalAlpha = 0.18;
+  g.stroke();
+  g.globalAlpha = 1;
+  g.shadowColor = '#ff2fd0';
+  g.shadowBlur = 18;
+  g.lineWidth = 2.5;
+  linePath();
+  g.stroke();
+  g.restore();
+
+  // buy and sell markers, labelled so color is never the only cue
+  var idx = {};
+  pts.forEach(function (p, i) { idx[p.ts] = i; });
   (s.recentDecisions || []).forEach(function (d) {
     if (d.action !== 'BUY' && d.action !== 'SELL') return;
-    var i = indexByTs[d.ts];
+    var i = idx[d.ts];
     if (i === undefined) return;
-    g.beginPath();
-    g.arc(x(i), y(pts[i].close), 5 * dpr, 0, Math.PI * 2);
-    g.fillStyle = d.action === 'BUY' ? '#39ff8f' : '#ff3860';
-    g.fill();
+    var col = d.action === 'BUY' ? '#39ff8f' : '#ff3860';
+    var mx = x(i), my = y(pts[i].close);
+    g.save();
+    g.shadowColor = col;
+    g.shadowBlur = 16;
+    g.beginPath(); g.arc(mx, my, 5, 0, Math.PI * 2);
+    g.fillStyle = col; g.fill();
+    g.restore();
+    g.fillStyle = col;
+    g.font = 'bold 10px system-ui, sans-serif';
+    g.textAlign = 'center';
+    g.fillText(d.action, mx, d.action === 'BUY' ? my + 18 : my - 10);
+    g.textAlign = 'left';
   });
 
+  // pulsing "now" dot at the newest price
+  var lx = x(pts.length - 1), ly = y(pts[pts.length - 1].close);
+  g.save();
+  g.shadowColor = '#2fe3ff';
+  g.shadowBlur = 24;
+  g.beginPath(); g.arc(lx, ly, 4, 0, Math.PI * 2);
+  g.fillStyle = '#e8e3ff'; g.fill();
+  g.restore();
+
+  // time labels along the bottom
   g.fillStyle = '#8a7bb8';
-  g.font = (11 * dpr) + 'px sans-serif';
-  g.fillText('$' + max.toFixed(0), pad, 14 * dpr);
-  g.fillText('$' + min.toFixed(0), pad, h - 4 * dpr);
+  g.font = '10px system-ui, sans-serif';
+  g.fillText(timeLabel(pts[0].ts), L, cssH - 6);
+  g.textAlign = 'right';
+  g.fillText('now', cssW - R, cssH - 6);
+  g.textAlign = 'left';
+
+  // hover / touch readout
+  if (hoverX !== null && hoverX >= L && hoverX <= cssW - R) {
+    var hi = Math.round((hoverX - L) / w * (pts.length - 1));
+    hi = Math.max(0, Math.min(pts.length - 1, hi));
+    var hx = x(hi), hy = y(pts[hi].close);
+    g.strokeStyle = 'rgba(232,227,255,0.45)';
+    g.setLineDash([3, 4]);
+    g.beginPath(); g.moveTo(hx, T); g.lineTo(hx, T + h); g.stroke();
+    g.setLineDash([]);
+    g.save();
+    g.shadowColor = '#ff2fd0';
+    g.shadowBlur = 14;
+    g.beginPath(); g.arc(hx, hy, 5, 0, Math.PI * 2);
+    g.fillStyle = '#ffffff'; g.fill();
+    g.restore();
+    var txt = '$' + pts[hi].close.toFixed(2) + '  ' + timeLabel(pts[hi].ts);
+    g.font = '12px system-ui, sans-serif';
+    var tw = g.measureText(txt).width + 14;
+    var bx = Math.min(hx + 10, cssW - R - tw);
+    var by = Math.max(T, hy - 34);
+    g.fillStyle = 'rgba(11,7,22,0.92)';
+    g.fillRect(bx, by, tw, 24);
+    g.strokeStyle = '#ff2fd0';
+    g.lineWidth = 1;
+    g.strokeRect(bx, by, tw, 24);
+    g.fillStyle = '#e8e3ff';
+    g.fillText(txt, bx + 7, by + 16);
+  }
 }
+
+(function setupChartHover() {
+  var c = document.getElementById('chart');
+  function moveTo(clientX) {
+    var r = c.getBoundingClientRect();
+    hoverX = clientX - r.left;
+    if (lastS) drawChart(lastS);
+  }
+  function clearHover() {
+    hoverX = null;
+    if (lastS) drawChart(lastS);
+  }
+  c.addEventListener('mousemove', function (e) { moveTo(e.clientX); });
+  c.addEventListener('mouseleave', clearHover);
+  c.addEventListener('touchstart', function (e) { moveTo(e.touches[0].clientX); }, { passive: true });
+  c.addEventListener('touchmove', function (e) { moveTo(e.touches[0].clientX); }, { passive: true });
+  c.addEventListener('touchend', clearHover);
+  window.addEventListener('resize', function () { if (lastS) drawChart(lastS); });
+})();
 
 function renderLog(list) {
   var t = document.getElementById('log');
