@@ -13,11 +13,13 @@ function check(cond, msg) {
 // Minimal D1-style wrapper over node:sqlite (prepare/bind/first/all/run).
 function makeD1() {
   const db = new DatabaseSync(':memory:');
-  db.exec(fs.readFileSync(new URL('../migrations/0001_init.sql', import.meta.url), 'utf8'));
+  for (const f of ['0001_init.sql', '0002_runs.sql']) {
+    db.exec(fs.readFileSync(new URL(`../migrations/${f}`, import.meta.url), 'utf8'));
+  }
   const api = (stmt, args) => ({
     first: async () => stmt.get(...args) ?? null,
     all: async () => ({ results: stmt.all(...args) }),
-    run: async () => { stmt.run(...args); return {}; },
+    run: async () => { const info = stmt.run(...args); return { meta: { changes: info.changes } }; },
   });
   return {
     prepare(sql) {
@@ -89,6 +91,14 @@ async function statusJSON() {
   const decisions = st.recentDecisions.slice().reverse();
   const actions = decisions.map((d) => d.action);
   check(actions.includes('BUY'), 'paper run: bot bought during the rise');
+  // Duplicate protection: repeating a run in the same minute must add nothing.
+  {
+    const before = (await statusJSON()).recentDecisions.length;
+    await runOnce(env);
+    await runOnce(env);
+    const after = (await statusJSON()).recentDecisions.length;
+    check(after === before, 'duplicate: repeated runs in the same minute add no decisions');
+  }
   check(actions.some((a) => a === 'SELL' || a === 'STOP-LOSS' || a === 'TAKE-PROFIT'), 'paper run: bot exited during the fall');
   check(st.mode.startsWith('PAPER'), 'status says PAPER mode');
   check(Math.abs(st.fees - 0.5 * (actions.filter((a) => a === 'BUY').length + actions.filter((a) => ['SELL', 'STOP-LOSS', 'TAKE-PROFIT'].includes(a)).length)) < 1e-9, 'fees: $0.50 per buy and per sell');
@@ -98,6 +108,15 @@ async function statusJSON() {
   check(bars.n <= CONFIG.keepBars, `price history capped at ${CONFIG.keepBars} minutes (has ${bars.n})`);
   console.log('   actions:', actions.join(', '));
   console.log('   final P/L: $' + st.profitLoss.toFixed(2) + ', trades: ' + st.trades + ', fees: $' + st.fees.toFixed(2));
+}
+
+// ---------- overlap: two simultaneous runs for one minute ----------
+{
+  const before = (await statusJSON()).recentDecisions.length;
+  NOW += 60000;
+  await Promise.all([runOnce(env), runOnce(env)]);
+  const after = (await statusJSON()).recentDecisions.length;
+  check(after === before + 1, 'overlap: two simultaneous runs for one minute make exactly one decision');
 }
 
 // ---------- feed failure: no trading on bad data ----------

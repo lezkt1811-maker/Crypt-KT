@@ -183,6 +183,12 @@ async function runOnce(env) {
   const db = env.DB;
   const minute = Math.floor(Date.now() / 60000);
 
+  // Claim this minute. If another run already claimed it, stop here, so
+  // overlapping or repeated executions can't place the same trade twice.
+  const claim = await db.prepare('INSERT OR IGNORE INTO runs (ts) VALUES (?)').bind(minute).run();
+  if (claim.meta?.changes !== 1) return;
+  await db.prepare('DELETE FROM runs WHERE ts NOT IN (SELECT ts FROM runs ORDER BY ts DESC LIMIT 500)').run();
+
   let price;
   try {
     price = await fetchCurrentPrice();
