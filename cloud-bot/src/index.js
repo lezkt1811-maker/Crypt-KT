@@ -9,8 +9,13 @@ const CONFIG = {
   stopLossPct: 0.03,        // sell if price falls 3% from its peak (trailing)
   takeProfitPct: 0.06,      // sell if price rises 6% above entry
   trailingStop: true,
-  feeFlat: 0.5,             // flat fee per trade for balances of $500 or less
-  feeRate: 0.001,           // 0.1% per trade for larger balances
+  // FEE MODEL - ESTIMATES, NOT VERIFIED ACCOUNT RATES.
+  // Coinbase's fee depends on your account tier and 30-day volume, and the full
+  // schedule is not published. 0.60% is the entry-tier taker rate cited by
+  // third-party sources. Confirm your rate in your Coinbase account and update it here.
+  takerFeeRate: 0.006,      // ESTIMATE: 0.60% of the amount traded, per market order
+  slippageRate: 0.0005,     // ESTIMATE: 0.05% price impact per fill (spread + slippage)
+  feeLabel: 'ESTIMATE: 0.60% taker fee + 0.05% slippage per fill. Not verified against your Coinbase account.',
   keepBars: 120,            // minute prices kept for the moving averages
   keepDecisions: 1000,      // decision log rows kept
 };
@@ -45,15 +50,29 @@ async function fetchRecentMinutes() {
 
 // ---------- Database helpers ----------
 
+// Older saved state has no costBasis or realizedPL. Derive them from cash and
+// holdings so that the accounting still reconciles.
+function normalize(state) {
+  if (state.costBasis === undefined) {
+    state.costBasis = state.holdings > 0 ? state.startingBalance - state.cash : 0;
+  }
+  if (state.realizedPL === undefined) {
+    state.realizedPL = state.cash - state.startingBalance + state.costBasis;
+  }
+  return state;
+}
+
 async function loadState(db) {
   const row = await db.prepare('SELECT data FROM state WHERE id = 1').first();
-  if (row) return JSON.parse(row.data);
+  if (row) return normalize(JSON.parse(row.data));
   return {
     cash: CONFIG.startingBalance,
     holdings: 0,
     entryPrice: null,
     peak: null,
     startingBalance: CONFIG.startingBalance,
+    costBasis: 0,       // cash spent on the open position, fee included
+    realizedPL: 0,      // profit/loss on closed trades, fees included
     trades: 0,
     wins: 0,
     fees: 0,
@@ -112,31 +131,59 @@ function broaderTrend(closes) {
   return 'flat';
 }
 
-function feeFor(value, startingBalance) {
-  return startingBalance <= 500 ? CONFIG.feeFlat : value * CONFIG.feeRate;
-}
-
+// Buy: half of the cash leaves the account, and the fee comes out of that amount.
+// The fill price includes slippage. Signals still use the quoted price.
 function buy(state, price) {
   const spend = state.cash * 0.5;
-  const fee = feeFor(spend, state.startingBalance);
+  const fill = price * (1 + CONFIG.slippageRate);
+  const fee = spend * CONFIG.takerFeeRate;
   state.cash -= spend;
-  state.holdings += (spend - fee) / price;
+  state.holdings += (spend - fee) / fill;
+  state.costBasis += spend;
   state.entryPrice = price;
   state.peak = price;
   state.trades += 1;
   state.fees += fee;
 }
 
+// Sell: the fee comes out of the proceeds. The trade's profit/loss is the net
+// proceeds minus the cost basis, so each fee is counted exactly once.
 function sell(state, price, exitType) {
-  const gross = state.holdings * price;
-  const fee = feeFor(gross, state.startingBalance);
-  if (price > state.entryPrice) state.wins += 1;
-  state.cash += gross - fee;
+  const fill = price * (1 - CONFIG.slippageRate);
+  const gross = state.holdings * fill;
+  const fee = gross * CONFIG.takerFeeRate;
+  const proceeds = gross - fee;
+  if (proceeds > state.costBasis) state.wins += 1;
+  state.cash += proceeds;
   state.fees += fee;
+  state.realizedPL += proceeds - state.costBasis;
+  state.costBasis = 0;
   state.holdings = 0;
   state.entryPrice = null;
   state.peak = null;
   if (exitType) state.protectExits += 1;
+}
+
+// What the open position is worth if sold now, after the exit fee and slippage.
+function sellNowValue(state, price) {
+  if (!(state.holdings > 0)) return 0;
+  return state.holdings * price * (1 - CONFIG.slippageRate) * (1 - CONFIG.takerFeeRate);
+}
+
+// Portfolio = cash + value of holdings if sold now. This equals
+// starting balance + realized P/L + unrealized P/L.
+function accounting(state, price) {
+  const netValue = price == null ? 0 : sellNowValue(state, price);
+  const holding = state.holdings > 0;
+  return {
+    portfolio: state.cash + netValue,
+    holdingsValue: price == null ? 0 : state.holdings * price,
+    holdingsNetValue: netValue,
+    unrealizedPL: holding ? netValue - state.costBasis : 0,
+    breakEvenPrice: holding
+      ? state.costBasis / (state.holdings * (1 - CONFIG.slippageRate) * (1 - CONFIG.takerFeeRate))
+      : null,
+  };
 }
 
 // Returns { action, note } and updates state in place.
@@ -235,22 +282,29 @@ async function status(env) {
   const db = env.DB;
   const state = await loadState(db);
   const price = state.lastPrice ?? null;
-  const portfolio = price === null ? state.cash : state.cash + state.holdings * price;
+  const acct = accounting(state, price);
   const { results } = await db.prepare('SELECT ts, price, action, note FROM decisions ORDER BY id DESC LIMIT 50').all();
   const { results: bars } = await db.prepare('SELECT ts, close FROM bars ORDER BY ts DESC LIMIT ?').bind(CONFIG.keepBars).all();
   const prices = bars.reverse().map((b) => ({ ts: b.ts, close: b.close }));
   return json({
     mode: 'PAPER (no real orders)',
+    feeModel: { takerFeeRate: CONFIG.takerFeeRate, slippageRate: CONFIG.slippageRate, label: CONFIG.feeLabel },
     startingBalance: state.startingBalance,
     cash: state.cash,
     holdings: state.holdings,
+    holdingsValue: acct.holdingsValue,
+    holdingsNetValue: acct.holdingsNetValue,
+    costBasis: state.costBasis,
     entryPrice: state.entryPrice,
     price,
-    portfolio,
-    profitLoss: portfolio - state.startingBalance,
+    portfolio: acct.portfolio,
+    profitLoss: acct.portfolio - state.startingBalance,
+    realizedPL: state.realizedPL,
+    unrealizedPL: acct.unrealizedPL,
+    feesPaid: state.fees,
+    breakEvenPrice: acct.breakEvenPrice,
     trades: state.trades,
     wins: state.wins,
-    fees: state.fees,
     protectExits: state.protectExits,
     lastRun: state.lastRun ?? null,
     recentDecisions: results,
@@ -302,6 +356,12 @@ const DASHBOARD_HTML = `<!doctype html>
   <div class="card"><div class="label">Trades</div><div class="val" id="trades">-</div></div>
   <div class="card"><div class="label">Cash</div><div class="val" id="cash">-</div></div>
   <div class="card"><div class="label">Holding</div><div class="val" id="holding">-</div></div>
+</div>
+
+<div class="card section">
+  <div class="label">Accounting (fees are estimates)</div>
+  <table id="acct"></table>
+  <div class="warn" id="feeNote"></div>
 </div>
 
 <div class="card section chartcard">
@@ -356,20 +416,52 @@ async function load() {
 
 var lastS = null, hoverX = null;
 
+function netValue(s, p) {
+  if (!(s.holdings > 0)) return 0;
+  return s.holdings * p * (1 - s.feeModel.slippageRate) * (1 - s.feeModel.takerFeeRate);
+}
+
+function signed(n) { return (n >= 0 ? '+' : '') + money(n); }
+
 function render(s) {
   lastS = s;
   var live = liveIsFresh();
+  var px = live ? livePrice : s.price;
   if (live && s.prices && s.prices.length) {
     s.prices[s.prices.length - 1] = { ts: s.prices[s.prices.length - 1].ts, close: livePrice };
   }
-  setText('portfolio', money(s.portfolio));
+  var net = px == null ? 0 : netValue(s, px);
+  var portfolio = s.cash + net;
+  var profitLoss = portfolio - s.startingBalance;
+  var holdingsValue = px == null ? 0 : s.holdings * px;
+  var unrealized = s.holdings > 0 ? net - s.costBasis : 0;
+
+  setText('portfolio', money(portfolio));
   var pl = document.getElementById('pl');
-  pl.textContent = (s.profitLoss >= 0 ? '+' : '') + money(s.profitLoss);
-  pl.className = 'val ' + (s.profitLoss >= 0 ? 'pos' : 'neg');
-  setText('price', live ? money(livePrice) : (s.price == null ? '-' : money(s.price)));
+  pl.textContent = signed(profitLoss);
+  pl.className = 'val ' + (profitLoss >= 0 ? 'pos' : 'neg');
+  setText('price', px == null ? '-' : money(px));
   setText('trades', s.trades);
   setText('cash', money(s.cash));
   setText('holding', s.holdings.toFixed(6) + ' BTC');
+
+  var rows = [
+    ['Starting balance', money(s.startingBalance)],
+    ['Available cash', money(s.cash)],
+    ['Bitcoin holdings', s.holdings.toFixed(8) + ' BTC'],
+    ['Holdings value at market', money(holdingsValue)],
+    ['Value if sold now (after fees)', money(net)],
+    ['Trading fees paid', money(s.feesPaid)],
+    ['Portfolio after fees', money(portfolio)],
+    ['Realized P/L (closed trades)', signed(s.realizedPL)],
+    ['Unrealized P/L (open position)', signed(unrealized)],
+    ['Break-even BTC price', s.breakEvenPrice == null ? '-' : money(s.breakEvenPrice)]
+  ];
+  document.getElementById('acct').innerHTML = rows.map(function (r) {
+    return '<tr><td>' + esc(r[0]) + '</td><td style="text-align:right">' + esc(r[1]) + '</td></tr>';
+  }).join('');
+  setText('feeNote', s.feeModel ? s.feeModel.label : '');
+
   drawChart(s);
   renderLog(s.recentDecisions);
 }
@@ -558,4 +650,4 @@ export default {
 };
 
 // Exported for testing.
-export { CONFIG, decide, broaderTrend, runOnce };
+export { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize };

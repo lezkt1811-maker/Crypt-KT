@@ -2,7 +2,7 @@
 // and a fake Coinbase feed. No network access, no real orders.
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
-import worker, { CONFIG, decide, broaderTrend, runOnce } from '../src/index.js';
+import worker, { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize } from '../src/index.js';
 
 let failures = 0;
 function check(cond, msg) {
@@ -75,7 +75,8 @@ async function statusJSON() {
   s = base(); s.peak = 106.5;
   const r2 = decide(s, 106.5, closes);
   check(r2.action === 'TAKE-PROFIT', 'take-profit: +6.5% from entry triggers TAKE-PROFIT');
-  check(CONFIG.startingBalance === 20 && CONFIG.feeFlat === 0.5, 'config: $20 start with flat $0.50 fee, like the page');
+  check(CONFIG.startingBalance === 20 && CONFIG.takerFeeRate === 0.006, 'config: $20 start, fee is a labelled percentage estimate');
+  check(/ESTIMATE/.test(CONFIG.feeLabel), 'config: fee is labelled as an estimate');
 }
 
 // ---------- end-to-end paper run ----------
@@ -101,13 +102,55 @@ async function statusJSON() {
   }
   check(actions.some((a) => a === 'SELL' || a === 'STOP-LOSS' || a === 'TAKE-PROFIT'), 'paper run: bot exited during the fall');
   check(st.mode.startsWith('PAPER'), 'status says PAPER mode');
-  check(Math.abs(st.fees - 0.5 * (actions.filter((a) => a === 'BUY').length + actions.filter((a) => ['SELL', 'STOP-LOSS', 'TAKE-PROFIT'].includes(a)).length)) < 1e-9, 'fees: $0.50 per buy and per sell');
+  check(st.feesPaid > 0 && st.realizedPL !== undefined, 'fees: recorded as a percentage of each trade');
+  check(Math.abs(st.portfolio - (st.cash + st.holdingsNetValue)) < 1e-9, 'portfolio = cash + holdings if sold now (after fees)');
+  check(Math.abs(st.portfolio - (st.startingBalance + st.realizedPL + st.unrealizedPL)) < 1e-9, 'accounting reconciles: portfolio = start + realized + unrealized');
   check(Math.abs(st.profitLoss - (st.portfolio - 20)) < 1e-9, 'P/L equals portfolio minus $20 start');
   check(decisions.length === path.length, `one decision logged per run (${decisions.length} of ${path.length})`);
   const bars = await env.DB.prepare('SELECT COUNT(*) AS n FROM bars').first();
   check(bars.n <= CONFIG.keepBars, `price history capped at ${CONFIG.keepBars} minutes (has ${bars.n})`);
   console.log('   actions:', actions.join(', '));
-  console.log('   final P/L: $' + st.profitLoss.toFixed(2) + ', trades: ' + st.trades + ', fees: $' + st.fees.toFixed(2));
+  console.log('   final P/L: $' + st.profitLoss.toFixed(2) + ', trades: ' + st.trades + ', fees: $' + st.feesPaid.toFixed(2));
+}
+
+// ---------- full buy-and-sell cycle with fees and slippage ----------
+{
+  const fee = CONFIG.takerFeeRate, slip = CONFIG.slippageRate;
+  const fresh = () => ({ cash: 20, holdings: 0, entryPrice: null, peak: null, startingBalance: 20, costBasis: 0, realizedPL: 0, trades: 0, wins: 0, fees: 0, protectExits: 0 });
+
+  // Buy at $100, sell at $110, computed by hand from the same rules.
+  const st = fresh();
+  buy(st, 100);
+  const spend = 10, buyFee = spend * fee, buyQty = (spend - buyFee) / (100 * (1 + slip));
+  check(Math.abs(st.cash - 10) < 1e-12, 'cycle: half the cash leaves on the buy');
+  check(Math.abs(st.holdings - buyQty) < 1e-12, 'cycle: BTC received = (spend - buy fee) / filled price');
+  check(Math.abs(st.costBasis - 10) < 1e-12, 'cycle: cost basis includes the buy fee');
+
+  const openAt105 = accounting(st, 105);
+  const expectedOpenNet = buyQty * 105 * (1 - slip) * (1 - fee);
+  check(Math.abs(openAt105.portfolio - (10 + expectedOpenNet)) < 1e-9, 'cycle: open position valued after exit fee and slippage');
+  check(Math.abs(openAt105.portfolio - (20 + openAt105.unrealizedPL)) < 1e-9, 'cycle: open portfolio = $20 + unrealized P/L');
+  check(Math.abs(accounting(st, openAt105.breakEvenPrice).portfolio - 20) < 1e-9, 'cycle: break-even price returns exactly the cost basis');
+
+  sell(st, 110, false);
+  const gross = buyQty * 110 * (1 - slip), sellFee = gross * fee, proceeds = gross - sellFee;
+  check(Math.abs(st.cash - (10 + proceeds)) < 1e-9, 'cycle: cash after sell = leftover cash + net proceeds');
+  check(Math.abs(st.fees - (buyFee + sellFee)) < 1e-9, 'cycle: fees paid = buy fee + sell fee, each counted once');
+  check(Math.abs(st.realizedPL - (proceeds - 10)) < 1e-9, 'cycle: realized P/L = net proceeds - cost basis');
+  check(Math.abs(st.cash - (20 + st.realizedPL)) < 1e-9, 'cycle: final cash reconciles to $20 + realized P/L');
+  check(Math.abs(accounting(st, 110).portfolio - (20 + st.realizedPL)) < 1e-9, 'cycle: portfolio after exit = $20 + realized P/L');
+
+  // Flat price: the round trip must lose money (fees and slippage), never show a profit.
+  const flat = fresh();
+  buy(flat, 100);
+  sell(flat, 100, false);
+  check(flat.realizedPL < 0, 'cycle: flat price round trip loses money to fees and slippage');
+  check(flat.wins === 0, 'cycle: a round trip that loses after fees is not counted as a win');
+
+  // Older saved state (fee was a flat $0.50, no costBasis/realizedPL) still reconciles.
+  const old = normalize({ cash: 10, holdings: 0.000114, startingBalance: 20, fees: 0.5, trades: 1, wins: 0 });
+  check(Math.abs(old.costBasis - 10) < 1e-12 && Math.abs(old.realizedPL) < 1e-12, 'migration: old open position gets cost basis and zero realized P/L');
+  check(Math.abs(accounting(old, 83000).portfolio - (20 + accounting(old, 83000).unrealizedPL)) < 1e-9, 'migration: old state reconciles');
 }
 
 // ---------- overlap: two simultaneous runs for one minute ----------
