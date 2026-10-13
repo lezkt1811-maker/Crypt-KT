@@ -182,6 +182,10 @@
       <button id="manualSellBtn" style="border-color:var(--red);color:var(--red);text-shadow:0 0 6px rgba(255,56,96,0.8);" disabled>↓ Sell Now (Manual)</button>
     </div>
     <div class="controls" style="margin-top:10px;">
+      <select id="sourceSel">
+        <option value="live">Data: Live BTC-USD (Coinbase)</option>
+        <option value="sim">Data: Simulated</option>
+      </select>
       <select id="strategySel">
         <option value="momentum">Strategy: Momentum</option>
         <option value="meanrev">Strategy: Mean Reversion</option>
@@ -279,7 +283,7 @@
 
 
 <footer>
-  Simulated price movement, seeded with today's real BTC price (~$64,000). Trades are 100% paper — fake $10,000 balance, no real exchange, no real funds ever touched.
+  Paper trades only — no orders are sent to any exchange and no real funds are touched. Live mode reads public BTC-USD prices from Coinbase; Simulated mode uses a random walk.
 </footer>
 
 <script>
@@ -289,17 +293,21 @@ let price = REAL_SEED_PRICE;
 let history = [price];
 const maxPoints = 120;
 
-function stepPrice(){
-  // random walk calibrated roughly to BTC's real daily volatility
-  const drift = (Math.random() - 0.5) * (price * 0.0025);
-  const shock = Math.random() < 0.03 ? (Math.random()-0.5) * (price * 0.015) : 0;
-  price = Math.max(1, price + drift + shock);
+function pushPoint(p){
+  price = p;
   history.push(price);
   if(history.length > maxPoints){
     history.shift();
     tradeMarkers.forEach(m => m.index--);
     tradeMarkers = tradeMarkers.filter(m => m.index >= 0);
   }
+}
+
+function stepPrice(){
+  // random walk calibrated roughly to BTC's real daily volatility
+  const drift = (Math.random() - 0.5) * (price * 0.0025);
+  const shock = Math.random() < 0.03 ? (Math.random()-0.5) * (price * 0.015) : 0;
+  pushPoint(Math.max(1, price + drift + shock));
 }
 
 // ---------- Sound cue on trade ----------
@@ -613,8 +621,92 @@ function start(){
   document.getElementById('statusPill').classList.add('running');
   document.getElementById('startBtn').disabled = true;
   document.getElementById('stopBtn').disabled = false;
-  log('bot started — watching the market', 'INIT', 'think');
-  loop();
+  document.getElementById('sourceSel').disabled = true;
+  liveMode = document.getElementById('sourceSel').value === 'live';
+  if(liveMode){
+    log('bot started — loading real BTC-USD prices from Coinbase', 'INIT', 'think');
+    startLive();
+  } else {
+    document.getElementById('chartTitle').textContent = 'BTC/USD — Simulated Chart (random walk seeded at ~$64,000)';
+    log('bot started — simulated market', 'INIT', 'think');
+    loop();
+  }
+}
+
+// ---------- Live market data (Coinbase public feed, BTC-USD) ----------
+// Paper trades only: this reads public prices and never places orders.
+const LIVE_TICK_MS = 15000;   // refresh the price every 15 seconds
+const TICKS_PER_BAR = 4;      // the bot makes one decision per minute
+const MAX_STALE_MS = 120000;  // don't trade on a price older than 2 minutes
+let liveMode = false;
+let liveTimer = null;
+let liveTickCount = 0;
+let lastGoodFetch = 0;
+
+function setFetchStatus(msg){
+  document.getElementById('fetchStatus').textContent = msg;
+}
+
+async function fetchJSON(url){
+  const r = await fetch(url, { cache: 'no-store' });
+  if(!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+async function fetchTickerPrice(){
+  const j = await fetchJSON('https://api.exchange.coinbase.com/products/BTC-USD/ticker');
+  const p = parseFloat(j.price);
+  if(!isFinite(p) || p <= 0) throw new Error('bad price in response');
+  return p;
+}
+
+async function fetchMinuteCloses(){
+  // rows come back newest-first: [time, low, high, open, close, volume]
+  const rows = await fetchJSON('https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60');
+  if(!Array.isArray(rows) || rows.length < 25) throw new Error('not enough candle history');
+  return rows.map(r => r[4]).reverse();
+}
+
+async function startLive(){
+  setFetchStatus('Loading real BTC-USD minute prices from Coinbase…');
+  document.getElementById('chartTitle').textContent = 'BTC/USD — Live Chart (Coinbase, 1-minute closes)';
+  try{
+    const closes = await fetchMinuteCloses();
+    if(!running) return; // stopped while loading
+    history = closes.slice(-maxPoints);
+    price = history[history.length - 1];
+    longMAHistory = [];
+    lastGoodFetch = Date.now();
+  }catch(e){
+    log(`could not load real prices (${e.message}) — bot not started. Try again or switch to Simulated.`, 'ERROR', 'think');
+    stop();
+    return;
+  }
+  liveTickCount = 0;
+  setFetchStatus('Live from Coinbase. Price refreshes every 15s; the bot decides once a minute.');
+  render();
+  liveTimer = setInterval(liveTick, LIVE_TICK_MS);
+}
+
+async function liveTick(){
+  if(!running) return;
+  try{
+    price = await fetchTickerPrice();
+    lastGoodFetch = Date.now();
+    setFetchStatus('Live from Coinbase · last price ' + new Date().toLocaleTimeString());
+  }catch(e){
+    setFetchStatus('price fetch failed (' + e.message + ') — retrying');
+  }
+  liveTickCount++;
+  if(liveTickCount % TICKS_PER_BAR === 0){
+    if(Date.now() - lastGoodFetch < MAX_STALE_MS){
+      pushPoint(price);
+      decide();
+    } else {
+      log('no fresh price for 2+ minutes — paused, not trading on old data', 'WATCH', 'think');
+    }
+  }
+  render();
 }
 
 function loop(){
@@ -626,6 +718,9 @@ function loop(){
 function stop(){
   running = false;
   clearTimeout(timer);
+  clearInterval(liveTimer);
+  liveTimer = null;
+  document.getElementById('sourceSel').disabled = false;
   document.getElementById('statusPill').textContent = 'STOPPED';
   document.getElementById('statusPill').classList.remove('running');
   document.getElementById('startBtn').disabled = false;
