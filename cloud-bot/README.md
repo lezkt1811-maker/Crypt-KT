@@ -63,3 +63,9 @@ disable its cron trigger or delete the Worker.
 This is a paper test. Even if it shows a profit, that doesn't mean the
 strategy will make money with real funds. Fees, slippage and changing markets
 all affect real results.
+
+## Automatic deploys
+
+Cloudflare is connected to this repo's `main` branch. Every push to `main` that
+changes the `cloud-bot` folder redeploys the bot and its dashboard. You don't
+need to paste code into Cloudflare anymore.
