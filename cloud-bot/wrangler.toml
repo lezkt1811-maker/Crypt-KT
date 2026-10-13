@@ -14,5 +14,5 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "crypt-bot"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "45195aa7-c8b1-427d-bc76-0667bbcb1cfb"
 migrations_dir = "migrations"
