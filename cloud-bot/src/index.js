@@ -163,14 +163,14 @@ function decide(state, price, closes) {
   const longMA = average(closes.slice(-20));
   const trend = broaderTrend(closes);
 
-  if (state.holdings === 0 && shortMA > longMA * 1.003) {
+  if (state.holdings === 0 && shortMA > longMA * 1.001) {
     if (CONFIG.trendFilter && trend === 'down') {
       return { action: 'FILTERED', note: 'buy signal, but broader trend is down' };
     }
     buy(state, price);
     return { action: 'BUY', note: `short average ${shortMA.toFixed(2)} above long average ${longMA.toFixed(2)}, trend: ${trend}` };
   }
-  if (state.holdings > 0 && shortMA < longMA * 0.997) {
+  if (state.holdings > 0 && shortMA < longMA * 0.999) {
     sell(state, price, false);
     return { action: 'SELL', note: `short average ${shortMA.toFixed(2)} fell below long average ${longMA.toFixed(2)}` };
   }

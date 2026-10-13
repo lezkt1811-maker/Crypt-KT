@@ -424,7 +424,7 @@ function decide(){
   }
 
   if(strategy === 'momentum'){
-    if(!holdings && shortMA > longMA * 1.003){
+    if(!holdings && shortMA > longMA * 1.001){
       if(trendFilterOn && trend === 'down'){
         log(`buy signal seen, but broader trend is down — skipping (trend filter)`, 'FILTERED', 'think');
       } else {
@@ -434,7 +434,7 @@ function decide(){
         log(`short MA ${(divergence*100).toFixed(2)}% above long MA, trend: ${trend} — confidence ${confidence}/100 ${starsFor(confidence)}`, 'BUY SIGNAL', 'buy');
         buy();
       }
-    } else if(holdings && shortMA < longMA * 0.997){
+    } else if(holdings && shortMA < longMA * 0.999){
       sell();
     } else {
       log(`short MA ${shortMA.toFixed(2)} vs long MA ${longMA.toFixed(2)} — no edge yet`, 'WATCH', 'think');
@@ -874,9 +874,9 @@ function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, tra
     if(shortMA===null || longMA===null) continue;
 
     if(strategy === 'momentum'){
-      if(!hold_ && shortMA > longMA*1.003){
+      if(!hold_ && shortMA > longMA*1.001){
         if(!(trendFilterOn && trend==='down')) doBuy();
-      } else if(hold_ && shortMA < longMA*0.997){ doSell(); }
+      } else if(hold_ && shortMA < longMA*0.999){ doSell(); }
     } else if(strategy === 'meanrev'){
       const dev = (p-longMA)/longMA;
       if(!hold_ && dev < -0.02) doBuy();
