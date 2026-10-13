@@ -305,7 +305,7 @@ const DASHBOARD_HTML = `<!doctype html>
 </div>
 
 <div class="card section chartcard">
-  <div class="label">Price, last 2 hours - touch or hover to inspect</div>
+  <div class="label">Price, last 2 hours - touch or hover to inspect <span id="liveTag" style="color:#39ff8f">&#9679; LIVE</span></div>
   <canvas id="chart"></canvas>
 </div>
 
@@ -323,6 +323,25 @@ function money(n) { return (n < 0 ? '-' : '') + '$' + Math.abs(n).toFixed(2); }
 function esc(v) { return String(v).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 function setText(id, text) { document.getElementById(id).textContent = text; }
 
+var livePrice = null, livePriceAt = 0;
+function liveIsFresh() { return livePrice !== null && Date.now() - livePriceAt < 20000; }
+
+async function refreshLivePrice() {
+  try {
+    var res = await fetch('https://api.exchange.coinbase.com/products/BTC-USD/ticker', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var j = await res.json();
+    var p = parseFloat(j.price);
+    if (!isFinite(p) || p <= 0) throw new Error('bad price');
+    livePrice = p;
+    livePriceAt = Date.now();
+    setText('liveTag', '\u25CF LIVE');
+    if (lastS) render(lastS);
+  } catch (e) {
+    setText('liveTag', '\u25CF PRICE FEED DOWN');
+  }
+}
+
 async function load() {
   try {
     var res = await fetch('/status', { cache: 'no-store' });
@@ -339,11 +358,15 @@ var lastS = null, hoverX = null;
 
 function render(s) {
   lastS = s;
+  var live = liveIsFresh();
+  if (live && s.prices && s.prices.length) {
+    s.prices[s.prices.length - 1] = { ts: s.prices[s.prices.length - 1].ts, close: livePrice };
+  }
   setText('portfolio', money(s.portfolio));
   var pl = document.getElementById('pl');
   pl.textContent = (s.profitLoss >= 0 ? '+' : '') + money(s.profitLoss);
   pl.className = 'val ' + (s.profitLoss >= 0 ? 'pos' : 'neg');
-  setText('price', s.price == null ? '-' : money(s.price));
+  setText('price', live ? money(livePrice) : (s.price == null ? '-' : money(s.price)));
   setText('trades', s.trades);
   setText('cash', money(s.cash));
   setText('holding', s.holdings.toFixed(6) + ' BTC');
@@ -514,6 +537,8 @@ function renderLog(list) {
 
 load();
 setInterval(load, REFRESH_MS);
+refreshLivePrice();
+setInterval(refreshLivePrice, 5000);
 </script>
 </body>
 </html>`;
