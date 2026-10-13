@@ -283,12 +283,11 @@ const DASHBOARD_HTML = `<!doctype html>
   .watch { color: #8a7bb8; }
   .warn { color: #ffb84d; font-size: 12px; margin: 12px 0 0; }
   .section { margin-top: 10px; }
-  body { background: radial-gradient(ellipse at 15% 0%, rgba(255,47,208,0.14), transparent 55%), radial-gradient(ellipse at 90% 100%, rgba(47,227,255,0.12), transparent 55%), #0b0716; min-height: 100vh; }
-  h1 { text-shadow: 0 0 8px rgba(255,47,208,0.9), 0 0 22px rgba(255,47,208,0.5); }
-  .card { box-shadow: 0 0 18px rgba(255,47,208,0.10), inset 0 0 18px rgba(47,227,255,0.04); }
-  .chartcard { box-shadow: 0 0 26px rgba(255,47,208,0.22), 0 0 60px rgba(47,227,255,0.10), inset 0 0 22px rgba(47,227,255,0.05); border-color: #5a2a8a; }
-  .pos { text-shadow: 0 0 10px rgba(57,255,143,0.8); }
-  .neg { text-shadow: 0 0 10px rgba(255,56,96,0.8); }
+  body { background: #0b0716; min-height: 100vh; }
+  .card { border-color: #3d2470; }
+  .chartcard { border-color: #ff2fd0; border-width: 2px; }
+  .pos { color: #39ff8f; }
+  .neg { color: #ff3860; }
   canvas { height: 280px; cursor: crosshair; touch-action: none; }
 </style>
 </head>
@@ -403,7 +402,7 @@ function drawChart(s) {
   g.lineTo(x(0), T + h);
   g.closePath();
   var fill = g.createLinearGradient(0, T, 0, T + h);
-  fill.addColorStop(0, 'rgba(255,47,208,0.38)');
+  fill.addColorStop(0, 'rgba(255,47,208,0.22)');
   fill.addColorStop(1, 'rgba(255,47,208,0)');
   g.fillStyle = fill;
   g.fill();
@@ -420,14 +419,7 @@ function drawChart(s) {
   g.lineCap = 'round';
   linePath();
   g.strokeStyle = grad;
-  g.lineWidth = 10;
-  g.globalAlpha = 0.18;
-  g.stroke();
-  g.globalAlpha = 1;
-  g.shadowColor = '#ff2fd0';
-  g.shadowBlur = 18;
-  g.lineWidth = 2.5;
-  linePath();
+  g.lineWidth = 3;
   g.stroke();
   g.restore();
 
@@ -440,12 +432,8 @@ function drawChart(s) {
     if (i === undefined) return;
     var col = d.action === 'BUY' ? '#39ff8f' : '#ff3860';
     var mx = x(i), my = y(pts[i].close);
-    g.save();
-    g.shadowColor = col;
-    g.shadowBlur = 16;
-    g.beginPath(); g.arc(mx, my, 5, 0, Math.PI * 2);
+    g.beginPath(); g.arc(mx, my, 6, 0, Math.PI * 2);
     g.fillStyle = col; g.fill();
-    g.restore();
     g.fillStyle = col;
     g.font = 'bold 10px system-ui, sans-serif';
     g.textAlign = 'center';
@@ -455,12 +443,8 @@ function drawChart(s) {
 
   // pulsing "now" dot at the newest price
   var lx = x(pts.length - 1), ly = y(pts[pts.length - 1].close);
-  g.save();
-  g.shadowColor = '#2fe3ff';
-  g.shadowBlur = 24;
-  g.beginPath(); g.arc(lx, ly, 4, 0, Math.PI * 2);
-  g.fillStyle = '#e8e3ff'; g.fill();
-  g.restore();
+  g.beginPath(); g.arc(lx, ly, 5, 0, Math.PI * 2);
+  g.fillStyle = '#2fe3ff'; g.fill();
 
   // time labels along the bottom
   g.fillStyle = '#8a7bb8';
@@ -479,12 +463,8 @@ function drawChart(s) {
     g.setLineDash([3, 4]);
     g.beginPath(); g.moveTo(hx, T); g.lineTo(hx, T + h); g.stroke();
     g.setLineDash([]);
-    g.save();
-    g.shadowColor = '#ff2fd0';
-    g.shadowBlur = 14;
     g.beginPath(); g.arc(hx, hy, 5, 0, Math.PI * 2);
     g.fillStyle = '#ffffff'; g.fill();
-    g.restore();
     var txt = '$' + pts[hi].close.toFixed(2) + '  ' + timeLabel(pts[hi].ts);
     g.font = '12px system-ui, sans-serif';
     var tw = g.measureText(txt).width + 14;
