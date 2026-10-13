@@ -1,0 +1,17 @@
+{
+  "name": "crypt-bot-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Paper-trading bot that runs on a Cloudflare cron schedule. No real orders are placed.",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "migrate": "wrangler d1 migrations apply crypt-bot --remote",
+    "migrate:local": "wrangler d1 migrations apply crypt-bot --local",
+    "deploy": "wrangler deploy",
+    "test": "node test/run-tests.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.150.0"
+  }
+}

@@ -1,0 +1,18 @@
+# Cloudflare Worker settings for the paper-trading bot.
+# Runs every minute. Paper trades only: it never places real orders.
+
+name = "crypt-bot"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Run once per minute.
+[triggers]
+crons = ["* * * * *"]
+
+# Free SQL database that stores the bot's state, price history and decisions.
+# Step 1 of the setup creates it and replaces the placeholder below with its id.
+[[d1_databases]]
+binding = "DB"
+database_name = "crypt-bot"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
