@@ -218,6 +218,7 @@
         <option value="300">Balance: $300 (real-world small)</option>
         <option value="200">Balance: $200 (real-world small)</option>
         <option value="100">Balance: $100 (real-world small)</option>
+        <option value="20">Balance: $20 (real-world tiny)</option>
       </select>
     </div>
   </div>
@@ -711,12 +712,13 @@ function renderCongressLog(){
 renderCongressLog();
 
 // ---------- Backtest (headless, runs current settings N times fast) ----------
-function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, ticks){
+function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, ticks, startBal){
   let p = REAL_SEED_PRICE;
   let hist = [p];
-  let cash_ = 10000, hold_ = 0, entry_ = null, peak_ = null;
+  let cash_ = startBal, hold_ = 0, entry_ = null, peak_ = null;
   let longMAHist = [];
-  const feeRate = 0.001;
+  // same fee model as the live bot, so backtests match what you'd see on screen
+  const feeFor = v => startBal <= 500 ? FLAT_FEE : v * FEE_RATE;
 
   function ma(arr, n){
     if(arr.length < n) return null;
@@ -733,13 +735,13 @@ function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, tra
   }
   function doBuy(){
     const spend = cash_ * 0.5;
-    const fee = spend * feeRate;
+    const fee = feeFor(spend);
     const qty = (spend - fee) / p;
     cash_ -= spend; hold_ += qty; entry_ = p; peak_ = p;
   }
   function doSell(){
     const gross = hold_ * p;
-    const fee = gross * feeRate;
+    const fee = feeFor(gross);
     cash_ += (gross - fee); hold_ = 0; entry_ = null; peak_ = null;
   }
 
@@ -780,7 +782,7 @@ function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, tra
       } else if(hold_ && p <= rl){ doSell(); }
     }
   }
-  return cash_ + hold_*p - 10000; // final P/L
+  return cash_ + hold_*p - startBal; // final P/L
 }
 
 function runBacktest(){
@@ -789,9 +791,10 @@ function runBacktest(){
   const stopLossPct = parseFloat(document.getElementById('stopLossSel').value);
   const takeProfitPct = parseFloat(document.getElementById('takeProfitSel').value);
   const trailingOn = document.getElementById('trailingSel').value === 'on';
+  const startBal = parseFloat(document.getElementById('balanceSel').value);
   const results = [];
   for(let i=0;i<20;i++){
-    results.push(simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, 300));
+    results.push(simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, 300, startBal));
   }
   const avg = results.reduce((a,b)=>a+b,0)/results.length;
   const wins_ = results.filter(r=>r>0).length;
