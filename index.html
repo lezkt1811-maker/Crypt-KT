@@ -162,7 +162,7 @@
 <header>
   <div>
     <h1>Ticker &amp; Trigger</h1>
-    <div class="sub">paper trading bot — simulated market — no real funds</div>
+    <div class="sub">paper trading bot — no real funds</div>
   </div>
   <div style="display:flex;align-items:center;">
   <div class="status-pill" id="statusPill">STOPPED</div>
@@ -230,7 +230,7 @@
 
 <div class="wrap">
   <div class="panel" style="grid-column: 1 / -1;">
-    <h2 id="chartTitle">BTC/USD — Live Chart (Simulated, seeded with today's real price)</h2>
+    <h2 id="chartTitle">BTC/USD — Chart</h2>
     <canvas id="chart"></canvas>
     <div class="stat-row">
       <div class="stat"><div class="label">Price</div><div class="value" id="priceVal">$0.00</div></div>
@@ -239,7 +239,7 @@
       <div class="stat"><div class="label">Portfolio</div><div class="value" id="portVal">$0.00</div></div>
       <div class="stat"><div class="label">P/L</div><div class="value" id="plVal">$0.00</div></div>
     </div>
-    <div id="fetchStatus" style="margin-top:4px;font-size:10px;color:var(--text-dim);">Seeded from real BTC price (~$64,000, Aug 2026). Movement from here is simulated. Fee model switches automatically based on balance selected.</div>
+    <div id="fetchStatus" style="margin-top:4px;font-size:10px;color:var(--text-dim);">Choose a data source and press Start. Live mode reads public Coinbase BTC-USD prices; Simulated mode uses a random walk. Fee model switches automatically based on balance selected.</div>
   </div>
 </div>
 
@@ -263,7 +263,11 @@
       <div class="row"><span>Stop-loss / take-profit exits</span><span id="protectExits">0</span></div>
     </div>
     <div class="controls" style="margin-top:16px;">
-      <button id="backtestBtn">⟳ Run 20 Simulations</button>
+      <select id="btSourceSel">
+        <option value="real">Backtest on: Real BTC history (hourly, ~12 days)</option>
+        <option value="sim">Backtest on: 20 simulated runs</option>
+      </select>
+      <button id="backtestBtn">⟳ Run Backtest</button>
     </div>
     <div id="backtestResults" style="margin-top:14px;font-size:12px;"></div>
     <h2 style="margin-top:20px;">Session History</h2>
@@ -273,9 +277,9 @@
 
 <div class="wrap">
   <div class="panel" style="grid-column: 1 / -1;">
-    <h2>Congress &amp; Presidential Watch — Real Disclosed Trades (Illustrative)</h2>
+    <h2>Congress &amp; Presidential Watch — Verified Disclosures Only</h2>
     <div style="font-size:11px;color:var(--text-dim);line-height:1.6;margin-bottom:14px;">
-      By law, members of Congress must disclose stock trades within 30–45 days (STOCK Act); the President's trustee-managed accounts are disclosed quarterly via OGE Form 278-T, in broad dollar ranges rather than exact figures. None of this is real-time, so it can't drive live trading. These are real, publicly filed examples, shown with their actual reporting lag.
+      By law, members of Congress must disclose stock trades within 30–45 days (STOCK Act); the President's trustee-managed accounts are disclosed quarterly via OGE Form 278-T, in broad dollar ranges rather than exact figures. None of this is real-time, so it can't drive live trading. Entries are added only from official filings, and none are shown until they are checked against those filings.
     </div>
     <div id="congressLog"></div>
   </div>
@@ -782,17 +786,15 @@ document.getElementById('themeToggleBtn').addEventListener('click', () => {
 reset();
 
 // ---------- Congress Watch (static, real illustrative disclosures) ----------
-const congressTrades = [
-  { name: 'Rep. Daniel Meuser (R-PA)', action: 'SELL', ticker: 'NVDA', tradeDate: '2026-06-16', filedDate: '2026-07-02', note: 'Partial sale, one of five NVDA filings in this window.' },
-  { name: 'Rep. Sara Jacobs (D-CA)', action: 'SELL', ticker: 'QCOM', tradeDate: '2026-05-06', filedDate: '2026-05-06', note: 'Partial sale, $500K–$1M range disclosed.' },
-  { name: 'Rep. Ro Khanna (D-CA)', action: 'MULTIPLE', ticker: 'various', tradeDate: 'ongoing', filedDate: 'ongoing', note: 'Most active trader in Congress — 4,900+ trades in the past year.' },
-  { name: 'President Trump (trustee-managed)', action: 'BUY', ticker: 'NVDA, AMD, AAPL, MSFT', tradeDate: '2026-01 to 2026-03', filedDate: '2026-05-08', note: 'Q1 2026 OGE Form 278-T: 3,600+ transactions, $220M–$750M cumulative disclosed range.' },
-  { name: 'President Trump (trustee-managed)', action: 'MULTIPLE', ticker: 'various', tradeDate: '2026-04 to 2026-06', filedDate: '2026-06-25', note: 'Q2 2026 OGE Form 278-T: 2,525 transactions, $201M–$712M cumulative disclosed range.' },
-];
+const congressTrades = []; // no entries until verified against official filings
 
 function renderCongressLog(){
   const el = document.getElementById('congressLog');
   el.innerHTML = '';
+  if(congressTrades.length === 0){
+    el.textContent = 'No entries yet. Official sources: House Clerk disclosures, Senate eFD, and OGE Form 278-T (oge.gov).';
+    return;
+  }
   congressTrades.forEach(t => {
     const singleDate = /^\d{4}-\d{2}-\d{2}$/.test(t.tradeDate);
     const lag = singleDate
@@ -806,11 +808,14 @@ function renderCongressLog(){
 }
 renderCongressLog();
 
-// ---------- Backtest (headless, runs current settings N times fast) ----------
-function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, ticks, startBal){
-  let p = REAL_SEED_PRICE;
+// ---------- Backtest (headless; real hourly history or simulated runs) ----------
+// Runs the current settings over a price series. If `series` is given, the
+// prices are that real history; otherwise a random walk is generated.
+function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, ticks, startBal, series){
+  let p = series ? series[0] : REAL_SEED_PRICE;
   let hist = [p];
   let cash_ = startBal, hold_ = 0, entry_ = null, peak_ = null;
+  let trades_ = 0;
   let longMAHist = [];
   // same fee model as the live bot, so backtests match what you'd see on screen
   const feeFor = v => startBal <= 500 ? FLAT_FEE : v * FEE_RATE;
@@ -833,17 +838,24 @@ function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, tra
     const fee = feeFor(spend);
     const qty = (spend - fee) / p;
     cash_ -= spend; hold_ += qty; entry_ = p; peak_ = p;
+    trades_++;
   }
   function doSell(){
     const gross = hold_ * p;
     const fee = feeFor(gross);
     cash_ += (gross - fee); hold_ = 0; entry_ = null; peak_ = null;
+    trades_++;
   }
 
-  for(let i=0;i<ticks;i++){
-    const drift = (Math.random()-0.5) * (p*0.0025);
-    const shock = Math.random() < 0.03 ? (Math.random()-0.5)*(p*0.015) : 0;
-    p = Math.max(1, p + drift + shock);
+  const n = series ? series.length : ticks;
+  for(let i=1;i<n;i++){
+    if(series){
+      p = series[i];
+    } else {
+      const drift = (Math.random()-0.5) * (p*0.0025);
+      const shock = Math.random() < 0.03 ? (Math.random()-0.5)*(p*0.015) : 0;
+      p = Math.max(1, p + drift + shock);
+    }
     hist.push(p);
     if(hist.length > 120) hist.shift();
 
@@ -877,30 +889,60 @@ function simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, tra
       } else if(hold_ && p <= rl){ doSell(); }
     }
   }
-  return cash_ + hold_*p - startBal; // final P/L
+  return { pl: cash_ + hold_*p - startBal, trades: trades_ };
 }
 
-function runBacktest(){
+// Coinbase returns at most 300 candles per request: 300 hourly bars is about 12.5 days.
+async function fetchHourlyCloses(){
+  const rows = await fetchJSON('https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=3600');
+  if(!Array.isArray(rows) || rows.length < 50) throw new Error('not enough candle history');
+  return rows.map(r => r[4]).reverse();
+}
+
+const rowStyle = 'display:flex;justify-content:space-between;border-bottom:1px dashed #2a1a4d;padding:5px 0;';
+
+async function runBacktest(){
   const strategy = document.getElementById('strategySel').value;
   const trendFilterOn = document.getElementById('trendFilterSel').value === 'on';
   const stopLossPct = parseFloat(document.getElementById('stopLossSel').value);
   const takeProfitPct = parseFloat(document.getElementById('takeProfitSel').value);
   const trailingOn = document.getElementById('trailingSel').value === 'on';
   const startBal = parseFloat(document.getElementById('balanceSel').value);
+  const el = document.getElementById('backtestResults');
+
+  if(document.getElementById('btSourceSel').value === 'real'){
+    el.textContent = 'Loading real hourly BTC-USD history from Coinbase…';
+    let series;
+    try{
+      series = await fetchHourlyCloses();
+    }catch(e){
+      el.textContent = 'Could not load real history (' + e.message + '). Try again later, or run the simulated backtest.';
+      return;
+    }
+    const r = simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, 0, startBal, series);
+    const chg = (series[series.length-1] / series[0] - 1) * 100;
+    el.innerHTML = `
+      <div class="row" style="${rowStyle}"><span>Strategy P/L on real history (fees included)</span><span style="color:${r.pl>=0?'var(--green)':'var(--red)'}">${r.pl>=0?'+':''}$${r.pl.toFixed(2)}</span></div>
+      <div class="row" style="${rowStyle}"><span>Trades</span><span>${r.trades}</span></div>
+      <div class="row" style="${rowStyle}"><span>BTC price change over the same ~12 days</span><span style="color:${chg>=0?'var(--green)':'var(--red)'}">${chg>=0?'+':''}${chg.toFixed(2)}%</span></div>
+      <div class="row" style="padding:5px 0;"><span>One fixed window. It can mislead: a different window can give a different result.</span></div>
+    `;
+    return;
+  }
+
   const results = [];
   for(let i=0;i<20;i++){
-    results.push(simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, 300, startBal));
+    results.push(simulateOneRun(strategy, trendFilterOn, stopLossPct, takeProfitPct, trailingOn, 300, startBal).pl);
   }
   const avg = results.reduce((a,b)=>a+b,0)/results.length;
   const wins_ = results.filter(r=>r>0).length;
   const best = Math.max(...results);
   const worst = Math.min(...results);
-  const el = document.getElementById('backtestResults');
   el.innerHTML = `
-    <div class="row" style="display:flex;justify-content:space-between;border-bottom:1px dashed #2a1a4d;padding:5px 0;"><span>Average P/L over 20 runs</span><span style="color:${avg>=0?'var(--green)':'var(--red)'}">${avg>=0?'+':''}$${avg.toFixed(2)}</span></div>
-    <div class="row" style="display:flex;justify-content:space-between;border-bottom:1px dashed #2a1a4d;padding:5px 0;"><span>Profitable runs</span><span>${wins_}/20</span></div>
-    <div class="row" style="display:flex;justify-content:space-between;border-bottom:1px dashed #2a1a4d;padding:5px 0;"><span>Best run</span><span style="color:var(--green)">+$${best.toFixed(2)}</span></div>
-    <div class="row" style="display:flex;justify-content:space-between;padding:5px 0;"><span>Worst run</span><span style="color:var(--red)">$${worst.toFixed(2)}</span></div>
+    <div class="row" style="${rowStyle}"><span>Average P/L over 20 simulated runs</span><span style="color:${avg>=0?'var(--green)':'var(--red)'}">${avg>=0?'+':''}$${avg.toFixed(2)}</span></div>
+    <div class="row" style="${rowStyle}"><span>Profitable runs</span><span>${wins_}/20</span></div>
+    <div class="row" style="${rowStyle}"><span>Best run</span><span style="color:var(--green)">+$${best.toFixed(2)}</span></div>
+    <div class="row" style="padding:5px 0;"><span>Worst run</span><span style="color:var(--red)">$${worst.toFixed(2)}</span></div>
   `;
 }
 
