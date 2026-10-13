@@ -61,7 +61,7 @@ Paper money only: nothing here connects to a real exchange account.
 
 ## 9. Confirm it's running (wait about 2 minutes first)
 
-- [ ] Open `https://crypt-bot.<your-name>.workers.dev/status` in your browser.
+- [ ] Open `https://crypt-bot.<your-name>.workers.dev` in your browser (the dashboard). For raw data, add `/status`.
       Check:
   - `"mode"` says `PAPER (no real orders)`.
   - `"lastRun"` has a number, not `null`.

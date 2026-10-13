@@ -4,8 +4,11 @@ This version runs every minute on Cloudflare's servers, even when your
 computer and browser are off. It uses **fake money** ($20) and the **real**
 Bitcoin price from Coinbase. It never places a real order.
 
-Check its numbers any time at:
-`https://crypt-bot.<your-subdomain>.workers.dev/status`
+Check it any time on your phone at:
+`https://crypt-bot.<your-subdomain>.workers.dev`
+
+That page is the dashboard: balance, profit or loss, the live price, a 2-hour
+chart with buy and sell markers, and recent decisions. Its raw data is at `/status`.
 
 ## One-time setup (about 15 minutes)
 
@@ -32,13 +35,13 @@ You'll need a free Cloudflare account and Node.js installed.
    ```
    npm run deploy
    ```
-   It prints your `workers.dev` address. Open it with `/status` added to see the numbers.
+   It prints your `workers.dev` address. Open it on your phone to see the dashboard.
 
 The bot starts running on the next minute.
 
 ## Checking it
 
-- `/status` shows cash, holdings, profit or loss, and the last 50 decisions.
+- The main page (`/`) is the phone dashboard. `/status` has the same numbers as raw data.
 - "WATCH" means it's waiting. "BUY", "SELL", "STOP-LOSS" and "TAKE-PROFIT"
   are trades, all on paper.
 - "ERROR" means the price couldn't be fetched. No trade is made.
