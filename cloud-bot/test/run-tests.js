@@ -131,5 +131,17 @@ async function statusJSON() {
   check(after.cash === before.cash && after.holdings === before.holdings, 'feed down: cash and holdings unchanged');
 }
 
+// ---------- phone dashboard ----------
+{
+  const page = await worker.fetch(new Request('https://x.test/'), env);
+  const html = await page.text();
+  check(page.headers.get('Content-Type').startsWith('text/html'), 'dashboard: root serves HTML');
+  check(html.includes('Crypt Bot') && html.includes("fetch('/status'"), 'dashboard: page reads /status');
+  check(html.trimStart().startsWith('<!doctype html>') && html.trimEnd().endsWith('</html>'), 'dashboard: page is a complete HTML document');
+  const st = await statusJSON();
+  check(Array.isArray(st.prices) && st.prices.length > 0 && st.prices.length <= CONFIG.keepBars, `status: includes price history for the chart (${st.prices.length} points)`);
+  check(st.prices.every((p) => typeof p.ts === 'number' && typeof p.close === 'number'), 'status: each price point has a time and a close');
+}
+
 if (failures) { console.log(`\n${failures} FAILED`); process.exit(1); }
 console.log('\nALL CHECKS PASSED');

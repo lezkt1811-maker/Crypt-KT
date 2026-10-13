@@ -237,6 +237,8 @@ async function status(env) {
   const price = state.lastPrice ?? null;
   const portfolio = price === null ? state.cash : state.cash + state.holdings * price;
   const { results } = await db.prepare('SELECT ts, price, action, note FROM decisions ORDER BY id DESC LIMIT 50').all();
+  const { results: bars } = await db.prepare('SELECT ts, close FROM bars ORDER BY ts DESC LIMIT ?').bind(CONFIG.keepBars).all();
+  const prices = bars.reverse().map((b) => ({ ts: b.ts, close: b.close }));
   return json({
     mode: 'PAPER (no real orders)',
     startingBalance: state.startingBalance,
@@ -252,8 +254,157 @@ async function status(env) {
     protectExits: state.protectExits,
     lastRun: state.lastRun ?? null,
     recentDecisions: results,
+    prices,
   });
 }
+
+// ---------- Phone dashboard (served at /) ----------
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crypt Bot</title>
+<style>
+  body { margin: 0; background: #0b0716; color: #e8e3ff; font-family: system-ui, sans-serif; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; color: #ff2fd0; }
+  .sub { font-size: 12px; color: #8a7bb8; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card { background: #120b22; border: 1px solid #2a1a4d; border-radius: 6px; padding: 12px; }
+  .label { font-size: 11px; color: #8a7bb8; text-transform: uppercase; letter-spacing: .08em; }
+  .val { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .pos { color: #39ff8f; }
+  .neg { color: #ff3860; }
+  canvas { width: 100%; height: 220px; display: block; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  td { padding: 6px 4px 6px 0; border-bottom: 1px dashed #2a1a4d; vertical-align: top; }
+  .buy { color: #39ff8f; }
+  .sell { color: #ff3860; }
+  .watch { color: #8a7bb8; }
+  .warn { color: #ffb84d; font-size: 12px; margin: 12px 0 0; }
+  .section { margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>Crypt Bot (paper money)</h1>
+<div class="sub" id="meta">Loading...</div>
+
+<div class="grid">
+  <div class="card"><div class="label">Portfolio</div><div class="val" id="portfolio">-</div></div>
+  <div class="card"><div class="label">Profit / loss</div><div class="val" id="pl">-</div></div>
+  <div class="card"><div class="label">BTC price</div><div class="val" id="price">-</div></div>
+  <div class="card"><div class="label">Trades</div><div class="val" id="trades">-</div></div>
+  <div class="card"><div class="label">Cash</div><div class="val" id="cash">-</div></div>
+  <div class="card"><div class="label">Holding</div><div class="val" id="holding">-</div></div>
+</div>
+
+<div class="card section">
+  <div class="label">Price, last 2 hours (green dot = buy, red dot = sell)</div>
+  <canvas id="chart"></canvas>
+</div>
+
+<div class="card section">
+  <div class="label">Recent decisions</div>
+  <table id="log"></table>
+</div>
+
+<div class="warn">Paper trading only. No real money is used.</div>
+
+<script>
+var REFRESH_MS = 30000;
+
+function money(n) { return (n < 0 ? '-' : '') + '$' + Math.abs(n).toFixed(2); }
+function esc(v) { return String(v).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+function setText(id, text) { document.getElementById(id).textContent = text; }
+
+async function load() {
+  try {
+    var res = await fetch('/status', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var s = await res.json();
+    render(s);
+    setText('meta', 'Updated ' + new Date().toLocaleTimeString() + ' - refreshes every 30 seconds');
+  } catch (e) {
+    setText('meta', 'Could not load status (' + e.message + '). Retrying...');
+  }
+}
+
+function render(s) {
+  setText('portfolio', money(s.portfolio));
+  var pl = document.getElementById('pl');
+  pl.textContent = (s.profitLoss >= 0 ? '+' : '') + money(s.profitLoss);
+  pl.className = 'val ' + (s.profitLoss >= 0 ? 'pos' : 'neg');
+  setText('price', s.price == null ? '-' : money(s.price));
+  setText('trades', s.trades);
+  setText('cash', money(s.cash));
+  setText('holding', s.holdings.toFixed(6) + ' BTC');
+  drawChart(s);
+  renderLog(s.recentDecisions);
+}
+
+function drawChart(s) {
+  var c = document.getElementById('chart');
+  var dpr = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr;
+  c.height = c.clientHeight * dpr;
+  var g = c.getContext('2d');
+  g.clearRect(0, 0, c.width, c.height);
+  var pts = s.prices || [];
+  if (pts.length < 2) {
+    g.fillStyle = '#8a7bb8';
+    g.font = (14 * dpr) + 'px sans-serif';
+    g.fillText('Waiting for price history...', 10 * dpr, 30 * dpr);
+    return;
+  }
+  var vals = pts.map(function (p) { return p.close; });
+  var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+  var range = (max - min) || 1;
+  var pad = 10 * dpr, w = c.width, h = c.height;
+  function x(i) { return pad + i / (pts.length - 1) * (w - 2 * pad); }
+  function y(v) { return h - pad - (v - min) / range * (h - 2 * pad); }
+
+  g.beginPath();
+  pts.forEach(function (p, i) { if (i) g.lineTo(x(i), y(p.close)); else g.moveTo(x(i), y(p.close)); });
+  g.strokeStyle = '#ff2fd0';
+  g.lineWidth = 2 * dpr;
+  g.stroke();
+
+  var indexByTs = {};
+  pts.forEach(function (p, i) { indexByTs[p.ts] = i; });
+  (s.recentDecisions || []).forEach(function (d) {
+    if (d.action !== 'BUY' && d.action !== 'SELL') return;
+    var i = indexByTs[d.ts];
+    if (i === undefined) return;
+    g.beginPath();
+    g.arc(x(i), y(pts[i].close), 5 * dpr, 0, Math.PI * 2);
+    g.fillStyle = d.action === 'BUY' ? '#39ff8f' : '#ff3860';
+    g.fill();
+  });
+
+  g.fillStyle = '#8a7bb8';
+  g.font = (11 * dpr) + 'px sans-serif';
+  g.fillText('$' + max.toFixed(0), pad, 14 * dpr);
+  g.fillText('$' + min.toFixed(0), pad, h - 4 * dpr);
+}
+
+function renderLog(list) {
+  var t = document.getElementById('log');
+  t.innerHTML = '';
+  (list || []).slice(0, 25).forEach(function (d) {
+    var cls = (d.action === 'BUY' || d.action === 'TAKE-PROFIT') ? 'buy'
+      : (d.action === 'SELL' || d.action === 'STOP-LOSS') ? 'sell' : 'watch';
+    var time = new Date(d.ts * 60000).toLocaleTimeString();
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + esc(time) + '</td><td class="' + cls + '"><b>' + esc(d.action) + '</b></td><td>' + esc(d.note) + '</td>';
+    t.appendChild(tr);
+  });
+}
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>`;
 
 export default {
   async scheduled(event, env, ctx) {
@@ -263,8 +414,8 @@ export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
     if (pathname === '/status') return status(env);
-    return new Response('Paper-trading bot is running. See /status for numbers. No real orders are placed.\n', {
-      headers: { 'Content-Type': 'text/plain' },
+    return new Response(DASHBOARD_HTML, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
   },
 };
