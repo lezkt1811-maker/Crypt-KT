@@ -16,9 +16,16 @@ const CONFIG = {
   takerFeeRate: 0.006,      // ESTIMATE: 0.60% of the amount traded, per market order
   slippageRate: 0.0005,     // ESTIMATE: 0.05% price impact per fill (spread + slippage)
   feeLabel: 'ESTIMATE: 0.60% taker fee + 0.05% slippage per fill. Not verified against your Coinbase account.',
-  retryDelaysMs: [2000, 4000], // price fetch retries after HTTP errors (exponential backoff, max 2 retries)
+  priceIntervalMs: 10000,       // refresh the BTC-USD price every 10 seconds
+  evalIntervalMs: 20000,        // evaluate the strategy every 20 seconds
+  cycleMs: 60000,               // one scheduled run covers one minute of checks
+  maxPriceAgeMs: 30000,         // a price older than this is stale: no signal is generated from it
+  rateLimitBaseMs: 10000,       // first pause after HTTP 429; doubles on each further 429
+  rateLimitMaxMs: 60000,        // longest pause after HTTP 429
+  minTradeIntervalMs: 120000,   // minimum time between actual trades (stop-losses are exempt)
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms))),
   keepBars: 120,            // minute prices kept for the moving averages
-  keepDecisions: 1000,      // decision log rows kept
+  keepDecisions: 3000,      // decision log rows kept
 };
 
 const HEADERS = { 'User-Agent': 'crypt-bot-paper/0.1', Accept: 'application/json' };
@@ -38,23 +45,6 @@ async function fetchCurrentPrice() {
   const price = parseFloat(data.price);
   if (!Number.isFinite(price) || price <= 0) throw new Error('bad price in response');
   return price;
-}
-
-// Retries only the price lookup. If every attempt fails, the caller records an
-// ERROR and does not trade.
-async function fetchCurrentPriceWithRetry() {
-  let lastErr;
-  for (let attempt = 0; attempt <= CONFIG.retryDelaysMs.length; attempt++) {
-    try {
-      return await fetchCurrentPrice();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < CONFIG.retryDelaysMs.length) {
-        await new Promise((resolve) => setTimeout(resolve, CONFIG.retryDelaysMs[attempt]));
-      }
-    }
-  }
-  throw lastErr;
 }
 
 // Last ~300 one-minute candles, oldest first: [minuteNumber, close]
@@ -91,6 +81,13 @@ async function loadState(db) {
     startingBalance: CONFIG.startingBalance,
     costBasis: 0,       // cash spent on the open position, fee included
     realizedPL: 0,      // profit/loss on closed trades, fees included
+    lastValid: null,    // last valid BTC-USD price
+    lastValidAt: 0,     // when that price was received (ms)
+    lastPriceAt: 0,     // last successful price update (ms)
+    lastEvalAt: 0,      // last strategy evaluation (ms)
+    lastTradeAt: 0,     // last actual trade (ms)
+    rateLimitUntil: 0,  // no price requests until this time (ms)
+    rateLimitStep: 0,   // consecutive HTTP 429 responses
     trades: 0,
     wins: 0,
     fees: 0,
@@ -151,6 +148,11 @@ function broaderTrend(closes) {
 
 // Buy: half of the cash leaves the account, and the fee comes out of that amount.
 // The fill price includes slippage. Signals still use the quoted price.
+// Minimum time between actual trades. Stop-losses don't use this check.
+function canTrade(state) {
+  return Date.now() - (state.lastTradeAt || 0) >= CONFIG.minTradeIntervalMs;
+}
+
 function buy(state, price) {
   const spend = state.cash * 0.5;
   const fill = price * (1 + CONFIG.slippageRate);
@@ -162,6 +164,7 @@ function buy(state, price) {
   state.peak = price;
   state.trades += 1;
   state.fees += fee;
+  state.lastTradeAt = Date.now();
 }
 
 // Sell: the fee comes out of the proceeds. The trade's profit/loss is the net
@@ -180,6 +183,7 @@ function sell(state, price, exitType) {
   state.entryPrice = null;
   state.peak = null;
   if (exitType) state.protectExits += 1;
+  state.lastTradeAt = Date.now();
 }
 
 // What the open position is worth if sold now, after the exit fee and slippage.
@@ -216,7 +220,7 @@ function decide(state, price, closes) {
       sell(state, price, true);
       return { action: 'STOP-LOSS', note: `price moved ${(change * 100).toFixed(2)}% from ${CONFIG.trailingStop ? 'peak' : 'entry'}` };
     }
-    if (CONFIG.takeProfitPct > 0 && gain >= CONFIG.takeProfitPct) {
+    if (CONFIG.takeProfitPct > 0 && gain >= CONFIG.takeProfitPct && canTrade(state)) {
       sell(state, price, true);
       return { action: 'TAKE-PROFIT', note: `price up ${(gain * 100).toFixed(2)}% from entry` };
     }
@@ -228,40 +232,76 @@ function decide(state, price, closes) {
   const longMA = average(closes.slice(-20));
   const trend = broaderTrend(closes);
 
-  if (state.holdings === 0 && shortMA > longMA * 1.001) {
+  if (state.holdings === 0 && shortMA > longMA * 1.001 && state.cash > 0 && canTrade(state)) {
     if (CONFIG.trendFilter && trend === 'down') {
       return { action: 'FILTERED', note: 'buy signal, but broader trend is down' };
     }
     buy(state, price);
     return { action: 'BUY', note: `short average ${shortMA.toFixed(2)} above long average ${longMA.toFixed(2)}, trend: ${trend}` };
   }
-  if (state.holdings > 0 && shortMA < longMA * 0.999) {
+  if (state.holdings > 0 && shortMA < longMA * 0.999 && canTrade(state)) {
     sell(state, price, false);
     return { action: 'SELL', note: `short average ${shortMA.toFixed(2)} fell below long average ${longMA.toFixed(2)}` };
   }
   return { action: 'WATCH', note: `short ${shortMA.toFixed(2)} vs long ${longMA.toFixed(2)}, trend: ${trend}` };
 }
 
-// ---------- One scheduled run ----------
+// ---------- One scheduled run (covers one minute) ----------
+// Cloudflare's cron fires once a minute. Inside that minute this loop refreshes
+// the price every priceIntervalMs and evaluates the strategy every evalIntervalMs.
+
+async function refreshPrice(db, state, minute) {
+  const now = Date.now();
+  if (now < (state.rateLimitUntil || 0)) return; // backing off: keep the last valid price
+  try {
+    const price = await fetchCurrentPrice();
+    state.lastValid = price;
+    state.lastValidAt = now;
+    state.lastPriceAt = now;
+    state.lastRun = now;
+    state.rateLimitStep = 0;
+    state.rateLimitUntil = 0;
+    await saveBar(db, minute, price); // the current minute's bar follows the latest price
+    await saveState(db, state);
+  } catch (err) {
+    if (/HTTP 429/.test(err.message)) {
+      state.rateLimitStep = (state.rateLimitStep || 0) + 1;
+      const delay = Math.min(CONFIG.rateLimitMaxMs, CONFIG.rateLimitBaseMs * 2 ** (state.rateLimitStep - 1));
+      state.rateLimitUntil = now + delay;
+      await logDecision(db, minute, state.lastValid ?? 0, 'RATE-LIMIT', `Coinbase HTTP 429; pausing price requests for ${delay / 1000}s`);
+      await saveState(db, state);
+    }
+    // Other errors: keep the last valid price. evaluate() refuses stale data.
+  }
+}
+
+async function evaluate(db, state, minute) {
+  const now = Date.now();
+  state.lastEvalAt = now;
+  state.lastRun = now;
+  if (state.lastValid == null || now - (state.lastValidAt || 0) > CONFIG.maxPriceAgeMs) {
+    await logDecision(db, minute, state.lastValid ?? 0, 'STALE', 'no fresh price; no signal generated');
+    await saveState(db, state);
+    return;
+  }
+  const price = state.lastValid;
+  state.lastPrice = price;
+  const closes = await loadCloses(db); // includes this minute's bar at the latest price
+  const { action, note } = decide(state, price, closes);
+  await saveState(db, state);
+  await logDecision(db, minute, price, action, note);
+}
 
 async function runOnce(env) {
   const db = env.DB;
-  const minute = Math.floor(Date.now() / 60000);
+  const startedAt = Date.now();
+  const minute = Math.floor(startedAt / 60000);
 
   // Claim this minute. If another run already claimed it, stop here, so
   // overlapping or repeated executions can't place the same trade twice.
   const claim = await db.prepare('INSERT OR IGNORE INTO runs (ts) VALUES (?)').bind(minute).run();
   if (claim.meta?.changes !== 1) return;
   await db.prepare('DELETE FROM runs WHERE ts NOT IN (SELECT ts FROM runs ORDER BY ts DESC LIMIT 500)').run();
-
-  let price;
-  try {
-    price = await fetchCurrentPriceWithRetry();
-  } catch (err) {
-    // Don't trade on a failed price lookup. Record it and wait for the next run.
-    await logDecision(db, minute, 0, 'ERROR', `price fetch failed: ${err.message}`);
-    return;
-  }
 
   // First run (or after a gap): fill in recent history so the averages work right away.
   const count = await db.prepare('SELECT COUNT(*) AS n FROM bars').first();
@@ -271,20 +311,27 @@ async function runOnce(env) {
         await db.prepare('INSERT OR REPLACE INTO bars (ts, close) VALUES (?, ?)').bind(m, close).run();
       }
     } catch (err) {
-      await logDecision(db, minute, price, 'ERROR', `could not load history: ${err.message}`);
+      await logDecision(db, minute, 0, 'ERROR', `could not load history: ${err.message}`);
       return;
     }
   }
 
-  await saveBar(db, minute, price);
-  const closes = await loadCloses(db);
-
   const state = await loadState(db);
-  const { action, note } = decide(state, price, closes);
-  state.lastPrice = price;
-  state.lastRun = Date.now();
-  await saveState(db, state);
-  await logDecision(db, minute, price, action, note);
+  const endAt = startedAt + CONFIG.cycleMs;
+  let nextPriceAt = startedAt;
+  let nextEvalAt = startedAt;
+  while (Date.now() < endAt) {
+    const now = Date.now();
+    if (now >= nextPriceAt) {
+      await refreshPrice(db, state, minute);
+      nextPriceAt = now + CONFIG.priceIntervalMs;
+    }
+    if (now >= nextEvalAt) {
+      await evaluate(db, state, minute);
+      nextEvalAt = now + CONFIG.evalIntervalMs;
+    }
+    await CONFIG.sleep(Math.min(nextPriceAt, nextEvalAt, endAt) - Date.now());
+  }
 }
 
 // ---------- Web endpoints (read-only) ----------
@@ -299,7 +346,7 @@ function json(data, status = 200) {
 async function status(env) {
   const db = env.DB;
   const state = await loadState(db);
-  const price = state.lastPrice ?? null;
+  const price = state.lastValid ?? state.lastPrice ?? null;
   const acct = accounting(state, price);
   const { results } = await db.prepare('SELECT ts, price, action, note FROM decisions ORDER BY id DESC LIMIT 50').all();
   const { results: bars } = await db.prepare('SELECT ts, close FROM bars ORDER BY ts DESC LIMIT ?').bind(CONFIG.keepBars).all();
@@ -326,6 +373,16 @@ async function status(env) {
     wins: state.wins,
     protectExits: state.protectExits,
     lastRun: state.lastRun ?? null,
+    running: state.lastRun ? Date.now() - state.lastRun < 90000 : false,
+    lastPriceAt: state.lastPriceAt || null,
+    lastEvalAt: state.lastEvalAt || null,
+    nextPriceAt: state.lastPriceAt ? state.lastPriceAt + CONFIG.priceIntervalMs : null,
+    nextEvalAt: state.lastEvalAt ? state.lastEvalAt + CONFIG.evalIntervalMs : null,
+    rateLimitedUntil: state.rateLimitUntil > Date.now() ? state.rateLimitUntil : null,
+    lastTradeAt: state.lastTradeAt || null,
+    minTradeIntervalMs: CONFIG.minTradeIntervalMs,
+    priceIntervalMs: CONFIG.priceIntervalMs,
+    evalIntervalMs: CONFIG.evalIntervalMs,
     recentDecisions: results,
     prices,
   });
@@ -367,6 +424,7 @@ const DASHBOARD_HTML = `<!doctype html>
 <body>
 <h1>Crypt Bot (paper money)</h1>
 <div class="sub" id="meta">Loading...</div>
+<div class="sub" id="timing">Bot status: loading...</div>
 
 <div class="grid">
   <div class="card"><div class="label">Portfolio (market value)</div><div class="val" id="portfolio">-</div></div>
@@ -396,15 +454,26 @@ const DASHBOARD_HTML = `<!doctype html>
 <div class="warn">Paper trading only. No real money is used.</div>
 
 <script>
-var REFRESH_MS = 30000;
+var REFRESH_MS = 10000;
 
 function money(n) { return (n < 0 ? '-' : '') + '$' + Math.abs(n).toFixed(2); }
 function esc(v) { return String(v).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 function setText(id, text) { document.getElementById(id).textContent = text; }
 
+function clock(ms) { return ms ? new Date(ms).toLocaleTimeString() : '-'; }
+function renderTiming(s) {
+  var txt = 'Bot: ' + (s.running ? 'RUNNING' : 'NOT RUNNING') +
+    ' - last price ' + clock(s.lastPriceAt) +
+    ' - next check ' + clock(s.nextEvalAt) +
+    ' - price every ' + (s.priceIntervalMs / 1000) + 's, check every ' + (s.evalIntervalMs / 1000) + 's';
+  if (s.rateLimitedUntil) txt += ' - Coinbase rate limit, backing off until ' + clock(s.rateLimitedUntil);
+  setText('timing', txt);
+}
+
 var livePrice = null, livePriceAt = 0;
 function liveIsFresh() { return livePrice !== null && Date.now() - livePriceAt < 20000; }
 
+var liveDelay = 10000;
 async function refreshLivePrice() {
   try {
     var res = await fetch('https://api.exchange.coinbase.com/products/BTC-USD/ticker', { cache: 'no-store' });
@@ -414,11 +483,14 @@ async function refreshLivePrice() {
     if (!isFinite(p) || p <= 0) throw new Error('bad price');
     livePrice = p;
     livePriceAt = Date.now();
-    setText('liveTag', '\u25CF LIVE');
+    liveDelay = 10000;
+    setText('liveTag', '● LIVE ' + new Date().toLocaleTimeString());
     if (lastS) render(lastS);
   } catch (e) {
-    setText('liveTag', '\u25CF PRICE FEED DOWN');
+    liveDelay = Math.min(60000, liveDelay * 2);
+    setText('liveTag', '● PRICE FEED DOWN - retrying');
   }
+  setTimeout(refreshLivePrice, liveDelay);
 }
 
 async function load() {
@@ -427,7 +499,8 @@ async function load() {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var s = await res.json();
     render(s);
-    setText('meta', 'Updated ' + new Date().toLocaleTimeString() + ' - refreshes every 30 seconds');
+    setText('meta', 'Updated ' + new Date().toLocaleTimeString() + ' - refreshes every 10 seconds');
+    renderTiming(s);
   } catch (e) {
     setText('meta', 'Could not load status (' + e.message + '). Retrying...');
   }
@@ -650,7 +723,6 @@ function renderLog(list) {
 load();
 setInterval(load, REFRESH_MS);
 refreshLivePrice();
-setInterval(refreshLivePrice, 5000);
 </script>
 </body>
 </html>`;
@@ -670,4 +742,4 @@ export default {
 };
 
 // Exported for testing.
-export { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize, fetchCurrentPriceWithRetry };
+export { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize, refreshPrice, evaluate };

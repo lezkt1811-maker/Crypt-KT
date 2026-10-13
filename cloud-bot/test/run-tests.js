@@ -2,7 +2,7 @@
 // and a fake Coinbase feed. No network access, no real orders.
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
-import worker, { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize, fetchCurrentPriceWithRetry } from '../src/index.js';
+import worker, { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize, refreshPrice } from '../src/index.js';
 
 let failures = 0;
 function check(cond, msg) {
@@ -47,11 +47,20 @@ globalThis.fetch = async (url) => {
 };
 
 const env = { DB: makeD1() };
+CONFIG.sleep = async (ms) => { NOW += Math.max(0, ms); };
+CONFIG.priceIntervalMs = 60000;   // one price and one check per minute for the e2e checks
+CONFIG.evalIntervalMs = 60000;
+CONFIG.minTradeIntervalMs = 0;
 async function tick(price) {
   currentPrice = price;
   NOW += 60000;
   await runOnce(env);
 }
+async function loadStateForTest() {
+  const row = await env.DB.prepare('SELECT data FROM state WHERE id = 1').first();
+  return row ? normalize(JSON.parse(row.data)) : normalize({ cash: 20, holdings: 0, entryPrice: null, peak: null, startingBalance: 20, trades: 0, wins: 0, fees: 0, protectExits: 0 });
+}
+
 async function statusJSON() {
   const res = await worker.fetch(new Request('https://x.test/status'), env);
   return res.json();
@@ -94,11 +103,14 @@ async function statusJSON() {
   check(actions.includes('BUY'), 'paper run: bot bought during the rise');
   // Duplicate protection: repeating a run in the same minute must add nothing.
   {
+    const minuteStart = NOW;
     const before = (await statusJSON()).recentDecisions.length;
     await runOnce(env);
+    const afterFirst = (await statusJSON()).recentDecisions.length;
+    NOW = minuteStart; // a repeated trigger arriving in the same minute
     await runOnce(env);
-    const after = (await statusJSON()).recentDecisions.length;
-    check(after === before, 'duplicate: repeated runs in the same minute add no decisions');
+    const afterRepeat = (await statusJSON()).recentDecisions.length;
+    check(afterFirst - before === 1 && afterRepeat === afterFirst, 'duplicate: the first run makes one check; a repeat in the same minute adds none');
   }
   check(actions.some((a) => a === 'SELL' || a === 'STOP-LOSS' || a === 'TAKE-PROFIT'), 'paper run: bot exited during the fall');
   check(st.mode.startsWith('PAPER'), 'status says PAPER mode');
@@ -153,38 +165,100 @@ async function statusJSON() {
   check(Math.abs(accounting(old, 83000).portfolio - (20 + accounting(old, 83000).unrealizedPL)) < 1e-9, 'migration: old state reconciles');
 }
 
-// ---------- price fetch retries (HTTP 429 and other errors) ----------
+// ---------- 10-second prices, 20-second checks ----------
 {
+  const saved = { p: CONFIG.priceIntervalMs, e: CONFIG.evalIntervalMs };
+  CONFIG.priceIntervalMs = 10000;
+  CONFIG.evalIntervalMs = 20000;
+  let tickerCalls = 0;
   const realFetch = globalThis.fetch;
-  const savedDelays = CONFIG.retryDelaysMs;
-  CONFIG.retryDelaysMs = [0, 0];
-  let calls = 0;
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('/ticker')) tickerCalls += 1;
+    return realFetch(url, opts);
+  };
   try {
-    // Two rate-limit errors, then success: the price is returned after 3 attempts.
-    globalThis.fetch = async () => {
-      calls += 1;
-      if (calls <= 2) return new Response('rate limited', { status: 429 });
-      return Response.json({ price: '83000.5' });
-    };
-    const price = await fetchCurrentPriceWithRetry();
-    check(price === 83000.5 && calls === 3, 'retry: recovers after two HTTP 429 errors (3 attempts)');
-
-    // Always failing: exactly 1 + 2 retries, then an error is raised (no price, so no trade).
-    calls = 0;
-    globalThis.fetch = async () => { calls += 1; return new Response('rate limited', { status: 429 }); };
-    let threw = false;
-    try { await fetchCurrentPriceWithRetry(); } catch (e) { threw = true; }
-    check(threw && calls === 3, 'retry: gives up after 2 retries and raises an error');
-
-    // Through the bot: a failed lookup records an ERROR and changes no balances.
-    const before = (await statusJSON());
     NOW += 60000;
+    const before = (await statusJSON()).recentDecisions.length;
     await runOnce(env);
-    const after = (await statusJSON());
-    check(after.recentDecisions[0].action === 'ERROR' && after.cash === before.cash && after.holdings === before.holdings, 'retry: exhausted retries record ERROR and never trade');
+    const after = (await statusJSON()).recentDecisions.length;
+    check(tickerCalls === 6, `timing: one minute makes 6 price requests (every 10s), got ${tickerCalls}`);
+    check(after - before === 3, `timing: one minute makes 3 strategy checks (every 20s), got ${after - before}`);
   } finally {
     globalThis.fetch = realFetch;
-    CONFIG.retryDelaysMs = savedDelays;
+    CONFIG.priceIntervalMs = saved.p;
+    CONFIG.evalIntervalMs = saved.e;
+  }
+}
+
+// ---------- HTTP 429: exponential backoff, no repeated requests while limited ----------
+{
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return new Response('rate limited', { status: 429 }); };
+  try {
+    const state = await loadStateForTest();
+    const db = env.DB;
+    const t0 = Date.now();
+    await refreshPrice(db, state, 1);
+    check(calls === 1 && state.rateLimitStep === 1 && state.rateLimitUntil === t0 + 10000, 'backoff: first HTTP 429 pauses requests for 10 seconds');
+    await refreshPrice(db, state, 1);
+    check(calls === 1, 'backoff: no request is sent while paused');
+    NOW += 10000;
+    await refreshPrice(db, state, 1);
+    check(calls === 2 && state.rateLimitStep === 2 && state.rateLimitUntil === Date.now() + 20000, 'backoff: second HTTP 429 doubles the pause to 20 seconds');
+    NOW += 20000; await refreshPrice(db, state, 1);
+    NOW += 40000; await refreshPrice(db, state, 1);
+    NOW += 60000; await refreshPrice(db, state, 1);
+    check(state.rateLimitStep === 5 && state.rateLimitUntil === Date.now() + CONFIG.rateLimitMaxMs, 'backoff: pause is capped at 60 seconds');
+    globalThis.fetch = async () => Response.json({ price: '83100.25' });
+    NOW += CONFIG.rateLimitMaxMs;
+    await refreshPrice(db, state, 1);
+    check(state.lastValid === 83100.25 && state.rateLimitStep === 0 && state.rateLimitUntil === 0, 'backoff: a successful request clears the limit');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ---------- stale data: never generate a signal from an old or missing price ----------
+{
+  const state = await loadStateForTest();
+  state.lastValid = 83000; state.lastValidAt = Date.now() - 31000;
+  const decisionsBefore = (await statusJSON()).recentDecisions.length;
+  const cashBefore = state.cash;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('down', { status: 503 });
+  try {
+    await refreshPrice(env.DB, state, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const { evaluate } = await import('../src/index.js');
+  await evaluate(env.DB, state, 1);
+  const last = (await statusJSON()).recentDecisions[0];
+  check(last.action === 'STALE' && state.cash === cashBefore && state.holdings === 0, 'stale: a price older than 30s records STALE and trades nothing');
+}
+
+// ---------- minimum time between trades ----------
+{
+  const saved = CONFIG.minTradeIntervalMs;
+  CONFIG.minTradeIntervalMs = 120000;
+  try {
+    const st = { cash: 20, holdings: 0, entryPrice: null, peak: null, startingBalance: 20, costBasis: 0, realizedPL: 0, trades: 0, wins: 0, fees: 0, protectExits: 0, lastTradeAt: 0 };
+    const up = Array(15).fill(100).concat(Array(5).fill(101));
+    const down = Array(15).fill(100).concat(Array(5).fill(99.5));
+    NOW += 600000;
+    const first = decide(st, 101, up);
+    check(first.action === 'BUY', 'spacing: a clear buy signal trades when no trade happened recently');
+    const blocked = decide(st, 99.5, down);
+    check(blocked.action === 'WATCH' && st.holdings > 0, 'spacing: a sell signal within the minimum interval is not traded');
+    NOW += 120000;
+    const later = decide(st, 99.5, down);
+    check(later.action === 'SELL' && st.holdings === 0, 'spacing: the sell trades once the minimum interval has passed');
+    const stop = { cash: 10, holdings: 0.1, entryPrice: 100, peak: 110, startingBalance: 20, costBasis: 10, realizedPL: 0, trades: 1, wins: 0, fees: 0, protectExits: 0, lastTradeAt: Date.now() };
+    const stopped = decide(stop, 106, Array(20).fill(100));
+    check(stopped.action === 'STOP-LOSS', 'spacing: stop-loss is never blocked by the minimum interval');
+  } finally {
+    CONFIG.minTradeIntervalMs = saved;
   }
 }
 
@@ -205,7 +279,7 @@ async function statusJSON() {
   await runOnce(env);
   feedDown = false;
   const after = await statusJSON();
-  check(after.recentDecisions[0].action === 'ERROR', 'feed down: records an ERROR decision');
+  check(after.recentDecisions[0].action === 'STALE', 'feed down: records STALE (no signal from old data)');
   check(after.cash === before.cash && after.holdings === before.holdings, 'feed down: cash and holdings unchanged');
 }
 

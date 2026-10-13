@@ -3,7 +3,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { runOnce } from '../src/index.js';
+import { runOnce, CONFIG } from '../src/index.js';
 
 // ---- shared price path (deterministic) ----
 let seed = 42;
@@ -72,6 +72,12 @@ const wrap = (sql) => {
   return { ...api([]), bind: (...args) => api(args) };
 };
 const env = { DB: { prepare: wrap } };
+// The page makes one decision per tick with no trade spacing, so match that here:
+// one price and one check per minute, and no minimum time between trades.
+CONFIG.sleep = async (ms) => { NOW += Math.max(0, ms); };
+CONFIG.priceIntervalMs = 60000;
+CONFIG.evalIntervalMs = 60000;
+CONFIG.minTradeIntervalMs = 0;
 let NOW = Date.UTC(2026, 0, 1, 12, 0, 0);
 Date.now = () => NOW;
 let current = 64000;
