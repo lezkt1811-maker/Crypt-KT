@@ -2,7 +2,7 @@
 // and a fake Coinbase feed. No network access, no real orders.
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
-import worker, { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize } from '../src/index.js';
+import worker, { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize, fetchCurrentPriceWithRetry } from '../src/index.js';
 
 let failures = 0;
 function check(cond, msg) {
@@ -151,6 +151,41 @@ async function statusJSON() {
   const old = normalize({ cash: 10, holdings: 0.000114, startingBalance: 20, fees: 0.5, trades: 1, wins: 0 });
   check(Math.abs(old.costBasis - 10) < 1e-12 && Math.abs(old.realizedPL) < 1e-12, 'migration: old open position gets cost basis and zero realized P/L');
   check(Math.abs(accounting(old, 83000).portfolio - (20 + accounting(old, 83000).unrealizedPL)) < 1e-9, 'migration: old state reconciles');
+}
+
+// ---------- price fetch retries (HTTP 429 and other errors) ----------
+{
+  const realFetch = globalThis.fetch;
+  const savedDelays = CONFIG.retryDelaysMs;
+  CONFIG.retryDelaysMs = [0, 0];
+  let calls = 0;
+  try {
+    // Two rate-limit errors, then success: the price is returned after 3 attempts.
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls <= 2) return new Response('rate limited', { status: 429 });
+      return Response.json({ price: '83000.5' });
+    };
+    const price = await fetchCurrentPriceWithRetry();
+    check(price === 83000.5 && calls === 3, 'retry: recovers after two HTTP 429 errors (3 attempts)');
+
+    // Always failing: exactly 1 + 2 retries, then an error is raised (no price, so no trade).
+    calls = 0;
+    globalThis.fetch = async () => { calls += 1; return new Response('rate limited', { status: 429 }); };
+    let threw = false;
+    try { await fetchCurrentPriceWithRetry(); } catch (e) { threw = true; }
+    check(threw && calls === 3, 'retry: gives up after 2 retries and raises an error');
+
+    // Through the bot: a failed lookup records an ERROR and changes no balances.
+    const before = (await statusJSON());
+    NOW += 60000;
+    await runOnce(env);
+    const after = (await statusJSON());
+    check(after.recentDecisions[0].action === 'ERROR' && after.cash === before.cash && after.holdings === before.holdings, 'retry: exhausted retries record ERROR and never trade');
+  } finally {
+    globalThis.fetch = realFetch;
+    CONFIG.retryDelaysMs = savedDelays;
+  }
 }
 
 // ---------- overlap: two simultaneous runs for one minute ----------

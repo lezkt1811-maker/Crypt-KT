@@ -16,6 +16,7 @@ const CONFIG = {
   takerFeeRate: 0.006,      // ESTIMATE: 0.60% of the amount traded, per market order
   slippageRate: 0.0005,     // ESTIMATE: 0.05% price impact per fill (spread + slippage)
   feeLabel: 'ESTIMATE: 0.60% taker fee + 0.05% slippage per fill. Not verified against your Coinbase account.',
+  retryDelaysMs: [2000, 4000], // price fetch retries after HTTP errors (exponential backoff, max 2 retries)
   keepBars: 120,            // minute prices kept for the moving averages
   keepDecisions: 1000,      // decision log rows kept
 };
@@ -37,6 +38,23 @@ async function fetchCurrentPrice() {
   const price = parseFloat(data.price);
   if (!Number.isFinite(price) || price <= 0) throw new Error('bad price in response');
   return price;
+}
+
+// Retries only the price lookup. If every attempt fails, the caller records an
+// ERROR and does not trade.
+async function fetchCurrentPriceWithRetry() {
+  let lastErr;
+  for (let attempt = 0; attempt <= CONFIG.retryDelaysMs.length; attempt++) {
+    try {
+      return await fetchCurrentPrice();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < CONFIG.retryDelaysMs.length) {
+        await new Promise((resolve) => setTimeout(resolve, CONFIG.retryDelaysMs[attempt]));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 // Last ~300 one-minute candles, oldest first: [minuteNumber, close]
@@ -238,7 +256,7 @@ async function runOnce(env) {
 
   let price;
   try {
-    price = await fetchCurrentPrice();
+    price = await fetchCurrentPriceWithRetry();
   } catch (err) {
     // Don't trade on a failed price lookup. Record it and wait for the next run.
     await logDecision(db, minute, 0, 'ERROR', `price fetch failed: ${err.message}`);
@@ -298,6 +316,7 @@ async function status(env) {
     entryPrice: state.entryPrice,
     price,
     portfolio: acct.portfolio,
+    portfolioMarket: state.cash + acct.holdingsValue,
     profitLoss: acct.portfolio - state.startingBalance,
     realizedPL: state.realizedPL,
     unrealizedPL: acct.unrealizedPL,
@@ -350,8 +369,8 @@ const DASHBOARD_HTML = `<!doctype html>
 <div class="sub" id="meta">Loading...</div>
 
 <div class="grid">
-  <div class="card"><div class="label">Portfolio</div><div class="val" id="portfolio">-</div></div>
-  <div class="card"><div class="label">Profit / loss</div><div class="val" id="pl">-</div></div>
+  <div class="card"><div class="label">Portfolio (market value)</div><div class="val" id="portfolio">-</div></div>
+  <div class="card"><div class="label">Profit / loss if sold now</div><div class="val" id="pl">-</div></div>
   <div class="card"><div class="label">BTC price</div><div class="val" id="price">-</div></div>
   <div class="card"><div class="label">Trades</div><div class="val" id="trades">-</div></div>
   <div class="card"><div class="label">Cash</div><div class="val" id="cash">-</div></div>
@@ -436,7 +455,7 @@ function render(s) {
   var holdingsValue = px == null ? 0 : s.holdings * px;
   var unrealized = s.holdings > 0 ? net - s.costBasis : 0;
 
-  setText('portfolio', money(portfolio));
+  setText('portfolio', money(s.cash + holdingsValue));
   var pl = document.getElementById('pl');
   pl.textContent = signed(profitLoss);
   pl.className = 'val ' + (profitLoss >= 0 ? 'pos' : 'neg');
@@ -452,7 +471,8 @@ function render(s) {
     ['Holdings value at market', money(holdingsValue)],
     ['Value if sold now (after fees)', money(net)],
     ['Trading fees paid', money(s.feesPaid)],
-    ['Portfolio after fees', money(portfolio)],
+    ['Portfolio at market value', money(s.cash + holdingsValue)],
+    ['Portfolio if sold now (after fees)', money(portfolio)],
     ['Realized P/L (closed trades)', signed(s.realizedPL)],
     ['Unrealized P/L (open position)', signed(unrealized)],
     ['Break-even BTC price', s.breakEvenPrice == null ? '-' : money(s.breakEvenPrice)]
@@ -650,4 +670,4 @@ export default {
 };
 
 // Exported for testing.
-export { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize };
+export { CONFIG, decide, broaderTrend, runOnce, buy, sell, accounting, normalize, fetchCurrentPriceWithRetry };
