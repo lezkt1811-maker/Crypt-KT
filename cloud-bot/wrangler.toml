@@ -5,9 +5,9 @@ name = "crypt-bot"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-# Run once per minute.
-[triggers]
-crons = ["* * * * *"]
+# Scheduled runs are STOPPED. Remove the comment markers below to restart them.
+# [triggers]
+# crons = ["* * * * *"]
 
 # Free SQL database that stores the bot's state, price history and decisions.
 # Step 1 of the setup creates it and replaces the placeholder below with its id.
