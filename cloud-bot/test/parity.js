@@ -78,6 +78,7 @@ CONFIG.sleep = async (ms) => { NOW += Math.max(0, ms); };
 CONFIG.priceIntervalMs = 60000;
 CONFIG.evalIntervalMs = 60000;
 CONFIG.minTradeIntervalMs = 0;
+CONFIG.tradingEnabled = true; // compare decisions with trading on, as the page does
 let NOW = Date.UTC(2026, 0, 1, 12, 0, 0);
 Date.now = () => NOW;
 let current = 64000;

@@ -16,6 +16,7 @@ const CONFIG = {
   takerFeeRate: 0.006,      // ESTIMATE: 0.60% of the amount traded, per market order
   slippageRate: 0.0005,     // ESTIMATE: 0.05% price impact per fill (spread + slippage)
   feeLabel: 'ESTIMATE: 0.60% taker fee + 0.05% slippage per fill. Not verified against your Coinbase account.',
+  tradingEnabled: false,        // PAUSED: prices and checks keep running, but no trades are placed
   priceIntervalMs: 10000,       // refresh the BTC-USD price every 10 seconds
   evalIntervalMs: 20000,        // evaluate the strategy every 20 seconds
   cycleMs: 60000,               // one scheduled run covers one minute of checks
@@ -210,6 +211,9 @@ function accounting(state, price) {
 
 // Returns { action, note } and updates state in place.
 function decide(state, price, closes) {
+  if (!CONFIG.tradingEnabled) {
+    return { action: 'PAUSED', note: 'trading is paused; prices and checks continue, no trades are placed' };
+  }
   // Stop-loss and take-profit come first, like on the page.
   if (state.holdings > 0 && state.entryPrice) {
     if (state.peak === null || price > state.peak) state.peak = price;
@@ -373,6 +377,7 @@ async function status(env) {
     wins: state.wins,
     protectExits: state.protectExits,
     lastRun: state.lastRun ?? null,
+    tradingEnabled: CONFIG.tradingEnabled,
     running: state.lastRun ? Date.now() - state.lastRun < 90000 : false,
     lastPriceAt: state.lastPriceAt || null,
     lastEvalAt: state.lastEvalAt || null,
@@ -467,6 +472,7 @@ function renderTiming(s) {
     ' - next check ' + clock(s.nextEvalAt) +
     ' - price every ' + (s.priceIntervalMs / 1000) + 's, check every ' + (s.evalIntervalMs / 1000) + 's';
   if (s.rateLimitedUntil) txt += ' - Coinbase rate limit, backing off until ' + clock(s.rateLimitedUntil);
+  if (!s.tradingEnabled) txt += ' - TRADING PAUSED';
   setText('timing', txt);
 }
 

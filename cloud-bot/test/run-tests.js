@@ -51,6 +51,7 @@ CONFIG.sleep = async (ms) => { NOW += Math.max(0, ms); };
 CONFIG.priceIntervalMs = 60000;   // one price and one check per minute for the e2e checks
 CONFIG.evalIntervalMs = 60000;
 CONFIG.minTradeIntervalMs = 0;
+CONFIG.tradingEnabled = true; // these checks exercise trading; the pause has its own check below
 async function tick(price) {
   currentPrice = price;
   NOW += 60000;
@@ -259,6 +260,20 @@ async function statusJSON() {
     check(stopped.action === 'STOP-LOSS', 'spacing: stop-loss is never blocked by the minimum interval');
   } finally {
     CONFIG.minTradeIntervalMs = saved;
+  }
+}
+
+// ---------- trading pause ----------
+{
+  const state = await loadStateForTest();
+  const rising = Array(15).fill(100).concat(Array(5).fill(101));
+  CONFIG.tradingEnabled = false;
+  try {
+    const st = { cash: 20, holdings: 0, entryPrice: null, peak: null, startingBalance: 20, costBasis: 0, realizedPL: 0, trades: 0, wins: 0, fees: 0, protectExits: 0, lastTradeAt: 0 };
+    const paused = decide(st, 101, rising);
+    check(paused.action === 'PAUSED' && st.holdings === 0 && st.cash === 20, 'pause: a buy signal places no trade while trading is paused');
+  } finally {
+    CONFIG.tradingEnabled = true;
   }
 }
 
